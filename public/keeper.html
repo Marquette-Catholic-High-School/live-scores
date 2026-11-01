@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#12214D">
+  <meta name="robots" content="noindex">
+  <title>Scorekeeper · Marquette Catholic Live Scores</title>
+  <link rel="icon" href="/favicon.ico" sizes="48x48">
+  <link rel="icon" href="/assets/img/favicon-32.png" type="image/png" sizes="32x32">
+  <link rel="apple-touch-icon" href="/assets/img/apple-touch-icon.png">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/assets/css/app.css">
+  <script type="module" src="/assets/js/keeper.js"></script>
+</head>
+<body class="page-keeper">
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header site-header--compact">
+    <div class="container site-header__inner">
+      <a class="brand" href="/keeper">
+        <img class="brand__logo" src="/assets/img/logo.png" alt="" width="320" height="270">
+        <span class="brand__text">
+          <span class="brand__school" data-school-name>Marquette Catholic</span>
+          <span class="brand__title">Scorekeeper</span>
+        </span>
+      </a>
+      <div class="site-header__end">
+        <nav class="site-nav" aria-label="Sections">
+          <a class="site-nav__link" href="/admin" data-admin-link hidden>Admin</a>
+        </nav>
+        <span class="conn" role="status" data-conn data-state="connecting" title="Connecting to live updates">
+          <span class="conn__dot" aria-hidden="true"></span>
+          <span class="conn__label">Connecting…</span>
+        </span>
+        <div data-account></div>
+      </div>
+    </div>
+  </header>
+
+  <main id="main" class="container keeper" data-keeper></main>
+  <noscript><p class="noscript">The scorekeeper console needs JavaScript.</p></noscript>
+</body>
+</html>

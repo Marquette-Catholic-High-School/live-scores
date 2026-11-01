@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#12214D">
+  <meta name="robots" content="noindex">
+  <title>Sign in · Marquette Catholic Live Scores</title>
+  <link rel="icon" href="/favicon.ico" sizes="48x48">
+  <link rel="icon" href="/assets/img/favicon-32.png" type="image/png" sizes="32x32">
+  <link rel="apple-touch-icon" href="/assets/img/apple-touch-icon.png">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/assets/css/app.css">
+  <script type="module" src="/assets/js/login.js"></script>
+</head>
+<body class="page-auth">
+  <main id="main" class="auth">
+    <div class="auth__card">
+      <a class="auth__brand" href="/">
+        <img class="auth__logo" src="/assets/img/logo.png" alt="" width="320" height="270">
+        <span class="sr-only">Back to the scoreboard</span>
+      </a>
+      <div class="auth__heading">
+        <h1 class="auth__title">Scorekeeper sign-in</h1>
+        <p class="auth__sub"><span data-school-name>Marquette Catholic</span> Live Scores</p>
+      </div>
+
+      <form class="stack" method="post" data-login-form>
+        <label class="field">
+          <span class="field__label">Username</span>
+          <input class="input" id="username" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="64">
+        </label>
+        <label class="field">
+          <span class="field__label">Password</span>
+          <input class="input" id="password" name="password" type="password" autocomplete="current-password" required maxlength="1024">
+        </label>
+        <p class="form-error" role="alert" data-error hidden></p>
+        <button class="btn btn--primary btn--lg btn--block" type="submit" data-submit>Sign in</button>
+      </form>
+
+      <div class="stack" data-signed-in hidden></div>
+
+      <p class="auth__foot">Accounts are created by an admin. Forgot your password? Ask an admin to reset it.</p>
+    </div>
+    <a class="auth__back" href="/">‹ Back to the scoreboard</a>
+  </main>
+  <noscript><p class="noscript">Signing in needs JavaScript.</p></noscript>
+</body>
+</html>

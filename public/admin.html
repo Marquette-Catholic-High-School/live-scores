@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#12214D">
+  <meta name="robots" content="noindex">
+  <title>Admin · Marquette Catholic Live Scores</title>
+  <link rel="icon" href="/favicon.ico" sizes="48x48">
+  <link rel="icon" href="/assets/img/favicon-32.png" type="image/png" sizes="32x32">
+  <link rel="apple-touch-icon" href="/assets/img/apple-touch-icon.png">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/assets/css/app.css">
+  <script type="module" src="/assets/js/admin.js"></script>
+</head>
+<body class="page-admin">
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header site-header--compact">
+    <div class="container site-header__inner">
+      <a class="brand" href="/admin">
+        <img class="brand__logo" src="/assets/img/logo.png" alt="" width="320" height="270">
+        <span class="brand__text">
+          <span class="brand__school" data-school-name>Marquette Catholic</span>
+          <span class="brand__title">Admin</span>
+        </span>
+      </a>
+      <div class="site-header__end">
+        <nav class="site-nav" aria-label="Sections">
+          <a class="site-nav__link" href="/keeper">Scorekeeper</a>
+        </nav>
+        <span class="conn" role="status" data-conn data-state="connecting" title="Connecting to live updates">
+          <span class="conn__dot" aria-hidden="true"></span>
+          <span class="conn__label">Connecting…</span>
+        </span>
+        <div data-account></div>
+      </div>
+    </div>
+  </header>
+
+  <main id="main" class="container admin" data-admin>
+    <div class="loading" role="status" data-admin-loading>
+      <span class="spinner" aria-hidden="true"></span>
+      <span>Loading…</span>
+    </div>
+    <div data-admin-app hidden>
+      <div class="tabs" role="tablist" aria-label="Admin sections">
+        <button class="tab" type="button" role="tab" id="tab-games" aria-controls="panel-games" aria-selected="true" data-tab="games">Games</button>
+        <button class="tab" type="button" role="tab" id="tab-users" aria-controls="panel-users" aria-selected="false" tabindex="-1" data-tab="users">Scorekeepers</button>
+        <button class="tab" type="button" role="tab" id="tab-system" aria-controls="panel-system" aria-selected="false" tabindex="-1" data-tab="system">System</button>
+      </div>
+      <section class="tab-panel" id="panel-games" role="tabpanel" aria-labelledby="tab-games" data-panel="games"></section>
+      <section class="tab-panel" id="panel-users" role="tabpanel" aria-labelledby="tab-users" data-panel="users" hidden></section>
+      <section class="tab-panel" id="panel-system" role="tabpanel" aria-labelledby="tab-system" data-panel="system" hidden></section>
+    </div>
+  </main>
+  <noscript><p class="noscript">The admin console needs JavaScript.</p></noscript>
+</body>
+</html>

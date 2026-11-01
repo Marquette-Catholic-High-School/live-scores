@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#12214D">
+  <meta name="description" content="Live scores, schedules and results for Marquette Catholic High School athletics.">
+  <title>Live Scores · Marquette Catholic</title>
+  <link rel="icon" href="/favicon.ico" sizes="48x48">
+  <link rel="icon" href="/assets/img/favicon-32.png" type="image/png" sizes="32x32">
+  <link rel="apple-touch-icon" href="/assets/img/apple-touch-icon.png">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/assets/css/app.css">
+  <script type="module" src="/assets/js/scoreboard.js"></script>
+</head>
+<body class="page-board">
+  <a class="skip-link" href="#main">Skip to scores</a>
+  <header class="site-header">
+    <div class="container site-header__inner">
+      <a class="brand" href="/">
+        <img class="brand__logo" src="/assets/img/logo.png" alt="" width="320" height="270">
+        <span class="brand__text">
+          <span class="brand__school" data-school-name>Marquette Catholic</span>
+          <span class="brand__title">Live Scores</span>
+        </span>
+      </a>
+      <div class="site-header__end">
+        <span class="conn" role="status" data-conn data-state="connecting" title="Connecting to live updates">
+          <span class="conn__dot" aria-hidden="true"></span>
+          <span class="conn__label">Connecting…</span>
+        </span>
+      </div>
+    </div>
+  </header>
+
+  <main id="main" class="container board-page">
+    <div class="status-slot" data-status-slot></div>
+
+    <div class="loading" role="status" data-loading>
+      <span class="spinner" aria-hidden="true"></span>
+      <span>Loading scores…</span>
+    </div>
+
+    <section class="section" data-section="live" aria-labelledby="live-title" hidden>
+      <div class="section__head">
+        <h2 class="section__title" id="live-title"><span class="live-dot" aria-hidden="true"></span>Live now</h2>
+        <span class="section__count" data-count></span>
+      </div>
+      <ul class="cards" data-list></ul>
+    </section>
+
+    <section class="section" data-section="upcoming" aria-labelledby="upcoming-title" hidden>
+      <div class="section__head">
+        <h2 class="section__title" id="upcoming-title">Upcoming</h2>
+        <span class="section__count" data-count></span>
+      </div>
+      <div class="day-groups" data-groups></div>
+    </section>
+
+    <section class="section" data-section="final" aria-labelledby="final-title" hidden>
+      <div class="section__head">
+        <h2 class="section__title" id="final-title">Final</h2>
+        <span class="section__count" data-count></span>
+      </div>
+      <ul class="cards" data-list></ul>
+    </section>
+
+    <div class="empty" data-empty hidden>
+      <p class="empty__title">No games right now</p>
+      <p class="empty__text">Upcoming games and live scores show up here. Check back on game day.</p>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container site-footer__inner">
+      <p>Scores update live. Get them on your Lock Screen with <strong>Sports Updates</strong> in the MCHS app.</p>
+      <a class="site-footer__link" href="/login">Scorekeeper sign-in</a>
+    </div>
+  </footer>
+  <noscript><p class="noscript">Live scores need JavaScript. Turn it on to see the scoreboard.</p></noscript>
+</body>
+</html>

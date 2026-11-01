@@ -1,0 +1,5 @@
+# The deploy scripts run on Linux: keep LF line endings even in clones made on Windows.
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.jpg binary
