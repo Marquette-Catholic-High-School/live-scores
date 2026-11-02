@@ -12,6 +12,7 @@ import { PushService } from './push.js';
 import { RateLimiter } from './ratelimit.js';
 import { buildRouter } from './routes/index.js';
 import { Scheduler } from './scheduler.js';
+import { ScoreboardService } from './scoreboard.js';
 import { SseHub } from './sse.js';
 import { UserService } from './users.js';
 
@@ -26,6 +27,7 @@ export function createApp({
   schedulerIntervalMs = 60_000,
   globalRateLimitPerMinute = config.limits.rateLimitPerMinute,
   deviceRateLimitPerMinute = config.limits.deviceRateLimitPerMinute,
+  scoreboardOptions = {},
 } = {}) {
   const db = openDatabase(config.dbPath);
   const auth = new AuthService({ db, now, log });
@@ -51,13 +53,29 @@ export function createApp({
   });
   const games = new GameService({ db, config, now, log });
   const push = new PushService({ db, apns, config, log: log.child({ component: 'push' }), now, store: games, ...pushOptions });
+  const scoreboard = new ScoreboardService({ db, games, config, log: log.child({ component: 'scoreboard' }), now, ...scoreboardOptions });
+  games.setScoreboard(scoreboard);
+  // Feed status changes (connected, unreachable, ...) are part of the game's
+  // JSON for signed-in viewers, so they get a new version like any change.
+  scoreboard.setStatusListener((gameId) => {
+    db.run('UPDATE games SET version = version + 1 WHERE id = ?', gameId);
+    const game = games.getGame(gameId);
+    if (game) sse.publishGame(game.id, (authenticated) => games.serialize(game, { authenticated }));
+  });
+  // What decides which game a scoreboard drives (§11). When it changes, the
+  // feed is re-decided before the change is published, so the published game
+  // (and the next action's 409 check) already reflects it.
+  const feedKey = (game) =>
+    game ? JSON.stringify([game.status, game.scoreboard, game.scoreboardManual, game.sport, game.home.name, game.home.code, game.startedAt]) : null;
 
   games.setHooks({
     changed: (before, after) => {
+      if (feedKey(before) !== feedKey(after)) scoreboard.refresh({ quiet: after.id });
       sse.publishGame(after.id, (authenticated) => games.serialize(after, { authenticated }));
       push.changed(before, after);
     },
     removed: (game) => {
+      scoreboard.refresh();
       sse.publishRemoved(game.id);
       push.forget(game);
     },
@@ -71,7 +89,7 @@ export function createApp({
     devices: new RateLimiter({ limit: deviceRateLimitPerMinute, windowMs: 60_000, now }),
   };
   const startedAt = now();
-  const router = buildRouter({ config, db, auth, users, apns, sse, games, push, log, now, startedAt, limiters });
+  const router = buildRouter({ config, db, auth, users, apns, sse, games, push, scoreboard, log, now, startedAt, limiters });
   const server = createHttpServer({ config, log, router, auth, now, globalLimiter: limiters.global });
 
   let closing = null;
@@ -86,11 +104,12 @@ export function createApp({
     sse,
     games,
     push,
+    scoreboard,
     scheduler,
     server,
     limiters,
 
-    async listen({ port = config.port, host = config.host, startScheduler = true } = {}) {
+    async listen({ port = config.port, host = config.host, startScheduler = true, startScoreboard = startScheduler } = {}) {
       await new Promise((resolve, reject) => {
         const onError = (err) => reject(err);
         server.once('error', onError);
@@ -100,6 +119,7 @@ export function createApp({
         });
       });
       if (startScheduler) scheduler.start();
+      if (startScoreboard) scoreboard.start();
       return server.address();
     },
 
@@ -108,6 +128,7 @@ export function createApp({
     close({ pushFlushTimeoutMs = 5000 } = {}) {
       closing ??= (async () => {
         await scheduler.stop();
+        scoreboard.stop();
         sse.closeAll();
         await new Promise((resolve) => {
           if (!server.listening) {

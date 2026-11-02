@@ -521,6 +521,53 @@ elsewhere without a code change with the launch argument
 Anyone can also follow a game from its detail screen in the app with **Show on Lock
 Screen**, even if they had Sports Updates off.
 
+### 8.1 Scores from the Daktronics scoreboard (optional)
+
+The server can read the gym scoreboard and keep the score, game clock and period up to
+date by itself. It works with a **Daktronics All Sport 5000** console whose data output
+goes to a **Lantronix** serial-to-Ethernet box (the box Daktronics uses for video
+systems), for **basketball and volleyball** games where **Marquette is the home team**.
+Volleyball reads the points in the current set, the set number and each finished set's
+score. Nothing else is read (no fouls, timeouts or possession), and the server never
+sends anything to the box.
+
+**Set it up once**
+
+1. Find the Lantronix box's IP address on the school network and make sure the VM can
+   reach it (same network, or a route/VLAN to it - Daktronics often puts its equipment on
+   its own 192.168.x.x network behind a router). The box listens on **TCP port 10001**
+   unless it was set up differently, and its serial port must be set to 19200 baud, 8 data
+   bits, no parity, 1 stop bit (the Daktronics setting for All Sport data). Test from the
+   VM with `nc -v <ip> 10001` (you should see characters scroll while the console is on).
+2. In the portal: **Admin → System → Daktronics scoreboard**, enter the address (e.g.
+   `10.20.1.50`, or `10.20.1.50:3001` for another port), **Save**, then **Test
+   connection**. With the console on, it shows the clock, score and period it reads.
+3. New games use this default scoreboard. In a game's form you can pick **another
+   scoreboard** (e.g. a second gym) or turn it **off** for that game.
+
+The box accepts only **one connection at a time**. If another system already uses it
+(for example a Daktronics video or graphics system), the test says "connection refused".
+Then either that system or the server can read it, not both.
+
+**On game day**
+
+* A person still claims and starts the game; once it is live the server connects to
+  the scoreboard. The scorekeeper console (portal and app) shows the scoreboard status,
+  and the score, clock, period and undo buttons are locked: the scoreboard wins. Notes
+  (Timeout, Halftime, ...) and **End game** stay with the scorekeeper.
+* Right after connecting, the score appears as soon as it changes on the scoreboard or
+  the operator stops the clock (the console only sends what changes).
+* If the scoreboard is wrong or can't be reached, tap **Score by hand**: the feed pauses
+  for that game and the buttons work again. **Use the scoreboard** switches back; the
+  scoreboard's numbers then replace the hand-entered ones.
+* If two live games point at the same scoreboard (a JV game nobody ended, then
+  varsity), the game started last gets the readings; the other one switches to scoring
+  by hand and stays that way, even after the newer game ends.
+* If the operator resets the scoreboard for the next game before this one was ended,
+  the server doesn't copy the reset: after 30 seconds the game switches to scoring by
+  hand with its final score intact, ready to be ended.
+* When the game ends, the server disconnects from the box.
+
 ## 9. Verify APNs
 
 ```bash
@@ -575,8 +622,9 @@ Things to know:
   with their defaults, e.g. `SCHOOL_TIMEZONE` (`America/Chicago`, or what you enter at
   the prompt / pass with `--school-timezone`) and the capacity keys. Its output line
   `Updated /etc/mchs-live/mchs-live.env: …` lists what changed.
-* The server updates the database schema by itself when it starts (now version 2, which
-  adds the tables that let pushes survive a restart). An older server refuses a database
+* The server updates the database schema by itself when it starts (now version 3:
+  version 2 added the tables that let pushes survive a restart, version 3 the scoreboard
+  settings of section 8.1). An older server refuses a database
   a newer one has updated ("schema version … is newer than this server"): to go back to
   an older version, re-run its installer (it stops because the server doesn't start),
   then `sudo mchs-live-restore` the `-pre-upgrade` backup taken before the upgrade
@@ -786,6 +834,24 @@ For example, nginx needs `proxy_buffering off;` and `proxy_read_timeout 3600s;` 
 `/api/stream`. A Cloudflare Tunnel (section 5.3) streams it as is, and the installer
 checks this. Clients reconnect on their own after any interruption.
 
+### The scoreboard feed doesn't update a game
+
+The scorekeeper console shows the reason under "Scoreboard":
+* *Can't reach the scoreboard ... connection refused*: wrong port, or another system
+  already holds the box's one connection. *no answer*: wrong IP address, the box is off,
+  or the VM can't reach that network. Test from the VM: `nc -v <ip> 10001`.
+* *Connected, waiting for data*: the console is off, or the Lantronix serial settings
+  don't match (19200 8N1), or the cable is wrong (Daktronics: a null-modem cable from the
+  console's J6 port). Random characters with `nc` mean a baud-rate mismatch.
+* *The scoreboard is driving another game*: two live games point at the same scoreboard;
+  end the older one.
+* Not shown at all: the game isn't basketball or volleyball, Marquette isn't the home team,
+  or the scoreboard is off for that game.
+* The score stays at the old value after connecting: the console sends only what changes;
+  it catches up at the next score or when the operator stops the clock.
+* If the console's **RTD OFFSET** setting isn't 0, positions are shifted; the server
+  allows for 5000/10000/15000, but 0 is safest.
+
 ### The server doesn't start
 
 `journalctl -u mchs-live -n 50` shows the reason. "Invalid configuration" lists the
@@ -815,6 +881,9 @@ with `--yes`).
   is: the connector only connects out. Node listens on 127.0.0.1, the firewall denies
   everything else inbound, and SSH should be limited to your admin network
   (`--ssh-from`).
+* The scoreboard feed (section 8.1) only ever connects to the IP addresses an admin
+  entered, only reads from them, and only while a game needs it. Only admins can set
+  or test addresses; the scoreboard status is shown to signed-in staff only.
 * The Cloudflare Tunnel token is a secret (`/etc/mchs-live/cloudflare-tunnel.token`,
   root only). If it leaks, move to a new tunnel as described in section 5.3 ("The token
   leaked"): refreshing the token does not disconnect a connector already running.

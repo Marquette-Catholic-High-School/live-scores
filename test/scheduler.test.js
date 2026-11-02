@@ -119,7 +119,8 @@ describe('scheduler', () => {
     // Back to schema 1 with a game that ended an hour ago, channels still set.
     const db = openDatabase(path.join(dir, 'data', 'live.db'));
     const endedAt = local.clock.now() - HOUR;
-    db.exec('DROP TABLE push_progress; DROP TABLE pending_ends; DROP TABLE channel_cleanup; PRAGMA user_version = 1');
+    db.exec(`DROP TABLE push_progress; DROP TABLE pending_ends; DROP TABLE channel_cleanup; DROP TABLE settings;
+             ALTER TABLE games DROP COLUMN scoreboard; ALTER TABLE games DROP COLUMN scoreboard_manual; PRAGMA user_version = 1`);
     db.run(
       `INSERT INTO games (id, sport, home_name, home_code, home_color, away_name, away_code, away_color, scheduled_at, status,
                           channel_production, channel_sandbox, ended_at, created_at, updated_at)
@@ -129,7 +130,8 @@ describe('scheduler', () => {
     db.close();
     const upgraded = await startTestApp({ dir, clock: local.clock });
     try {
-      assert.equal(upgraded.app.db.schemaVersion, 2);
+      assert.equal(upgraded.app.db.schemaVersion, 3);
+      assert.equal(upgraded.app.games.getGame('legacygame').scoreboard, 'default', 'existing games use the default scoreboard');
       await upgraded.app.scheduler.tick();
       assert.equal(upgraded.transport.byKind('channel-delete').length, 0, 'kept until 6 h after the end');
       upgraded.clock.advance(5 * HOUR + 60_000);

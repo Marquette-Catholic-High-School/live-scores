@@ -489,7 +489,11 @@ hr { border: 0; border-top: 1px solid var(--border); margin: var(--space-1) 0; }
   cursor: pointer;
 }
 
-.checkbox__input { width: 22px; height: 22px; margin: 0; accent-color: var(--accent); }
+.checkbox__input { flex: none; width: 22px; height: 22px; margin: 0; accent-color: var(--accent); }
+
+/* Radio choices (.checkbox rows); a choice's own field sits under its label. */
+.choices { display: grid; gap: 2px; }
+.choices__more { padding: 2px 0 var(--space-2) calc(22px + var(--space-3)); }
 
 .form-grid {
   display: grid;
@@ -1510,6 +1514,26 @@ hr { border: 0; border-top: 1px solid var(--border); margin: var(--space-1) 0; }
 .control--pregame { padding: var(--space-5) var(--space-4); }
 .control--end { background: transparent; border-style: dashed; box-shadow: none; }
 
+/* Scoreboard feed: a box that can't be reached or sends nothing stands out. */
+.feed__text { font-weight: 600; }
+.feed__actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.feed[data-state="receiving"] .control__state { background: var(--ok-soft); color: var(--ok); }
+
+.feed[data-state="unreachable"],
+.feed[data-state="waiting"] { border-color: transparent; background: var(--warn-soft); color: var(--warn); }
+
+.feed[data-state="unreachable"] .control__title,
+.feed[data-state="unreachable"] .control__hint,
+.feed[data-state="waiting"] .control__title,
+.feed[data-state="waiting"] .control__hint { color: inherit; }
+
+.feed[data-state="unreachable"] .control__state,
+.feed[data-state="waiting"] .control__state { background: var(--warn); color: var(--warn-soft); }
+
+/* Wraps the controls the scoreboard takes over without adding a box. */
+.feed-lock { display: contents; }
+.feed-lock:disabled .disclosure__summary { cursor: not-allowed; opacity: 0.45; }
+
 .console__fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
 
 .console__scoring { display: grid; gap: var(--space-4); }
@@ -1762,6 +1786,7 @@ hr { border: 0; border-top: 1px solid var(--border); margin: var(--space-1) 0; }
 .arow__score { font-family: var(--font-score); font-variant-numeric: tabular-nums; }
 .arow__vs { color: var(--text-subtle); font-size: 0.875rem; font-weight: 600; }
 .arow__meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; color: var(--text-muted); font-size: 0.875rem; }
+.arow__feed.is-warn { color: var(--warn); font-weight: 650; }
 .arow__actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; max-width: 360px; }
 
 @media (max-width: 820px) {
@@ -1806,6 +1831,7 @@ hr { border: 0; border-top: 1px solid var(--border); margin: var(--space-1) 0; }
 
 .card__head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-2); }
 .card__title { font-size: 1.0625rem; font-weight: 800; }
+.card__subtitle { margin: var(--space-2) 0 0; font-size: 0.9375rem; font-weight: 750; }
 .card__text { color: var(--text-muted); }
 .card__actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); }
 .card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); gap: var(--space-4); }

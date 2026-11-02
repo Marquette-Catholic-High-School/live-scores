@@ -140,6 +140,18 @@ const MIGRATIONS = [
     SELECT 'sandbox', channel_sandbox, id, COALESCE(ended_at, updated_at) + 21600000 FROM games
      WHERE status IN ('final', 'canceled') AND channel_sandbox IS NOT NULL;
   `,
+  // 3: Daktronics scoreboard feed (§11): per-game source ('default' = the
+  // admin's default address, 'off', or "ip:port") and the scorekeeper's
+  // switch to manual scoring; settings holds the default address.
+  `
+  ALTER TABLE games ADD COLUMN scoreboard TEXT NOT NULL DEFAULT 'default';
+  ALTER TABLE games ADD COLUMN scoreboard_manual INTEGER NOT NULL DEFAULT 0;
+  CREATE TABLE settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  `,
 ];
 
 export class Database {

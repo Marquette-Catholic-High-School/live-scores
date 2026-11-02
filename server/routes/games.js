@@ -32,6 +32,18 @@ export function registerGameRoutes(router, { games }) {
 
   router.post('/api/games/:id/end', (ctx) => ({ game: view(games.end(ctx.params.id, ctx.user)) }), { auth: 'user' });
 
+  // Score this game by hand ({ manual: true }) or let the scoreboard drive it again (§11).
+  // The reply reads the game again: the feed may have switched it straight back
+  // (a newer game holds its scoreboard).
+  router.post(
+    '/api/games/:id/scoreboard',
+    (ctx) => {
+      const game = games.setScoreboardManual(ctx.params.id, ctx.user, ctx.body.manual);
+      return { game: view(games.getGame(game.id) ?? game) };
+    },
+    { auth: 'user' },
+  );
+
   // ---- admin ----
 
   router.post('/api/games', (ctx) => ({ game: view(games.create(ctx.body, ctx.user)) }), { auth: 'admin' });

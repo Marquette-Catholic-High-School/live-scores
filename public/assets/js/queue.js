@@ -183,9 +183,13 @@ export class ActionQueue {
         // refusal (no longer the holder, bad request) they would fail alike.
         // After a refused score, correction, clock or note change only an
         // undo right behind it goes too — it was meant to revert this one.
+        // A refusal because the scoreboard drives the game (ARCHITECTURE.md
+        // §11) discards nothing else: the server refuses each later scoring
+        // action on its own, and notes still go through.
         const later = this.#items.filter((other) => other !== item && other.gameId === item.gameId);
         let discard = later;
-        if (error.status === 409 && INDEPENDENT_TYPES.has(item.body.type)) discard = later[0]?.body.type === 'undo' ? [later[0]] : [];
+        if (error.code === 'scoreboard_active') discard = [];
+        else if (error.status === 409 && INDEPENDENT_TYPES.has(item.body.type)) discard = later[0]?.body.type === 'undo' ? [later[0]] : [];
         this.#items = this.#items.filter((other) => other !== item && !discard.includes(other));
         this.#saveItems();
         this.#setStatus(this.#items.length ? 'sending' : 'idle', null);

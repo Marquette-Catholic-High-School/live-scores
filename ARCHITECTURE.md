@@ -55,6 +55,10 @@ toggle, which now also opts the device in/out of game Live Activities.
   (service `mchs-live-tunnel`) holds outbound connections to Cloudflare, which
   terminates TLS and forwards to `http://127.0.0.1:8080`. Both set
   `X-Forwarded-For` (the client is the last hop) and `X-Forwarded-Proto`.
+* **Scoreboard feed** (optional, §11): while a basketball or volleyball game with the
+  school's team at home is live, the server reads the gym's Daktronics All Sport 5000
+  scoreboard through its Lantronix serial-to-Ethernet box (TCP client, read-only) and keeps
+  the game's score, clock and period in step.
 * **iOS**: SwiftUI app + WidgetKit extension. ActivityKit (iOS 18+ — the app's
   deployment target is 18.6, so broadcast channels are always available).
 
@@ -151,7 +155,9 @@ games(
   channel_production TEXT, channel_sandbox TEXT,   -- APNs broadcast channel ids
   started_at INTEGER, ended_at INTEGER,
   created_by INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-  version INTEGER NOT NULL DEFAULT 1 -- +1 on every state change
+  version INTEGER NOT NULL DEFAULT 1, -- +1 on every state change
+  scoreboard TEXT NOT NULL DEFAULT 'default',   -- schema 3, §11: 'default' | 'off' | '<ip>:<port>'
+  scoreboard_manual INTEGER NOT NULL DEFAULT 0  -- schema 3, §11: 1 = the scorekeeper scores this game by hand
 )
 game_events(
   id INTEGER PRIMARY KEY,
@@ -194,9 +200,11 @@ channel_cleanup(                     -- PRIMARY KEY (environment, channel_id)
   environment, channel_id, game_id,
   delete_after INTEGER NOT NULL      -- when the scheduler may delete the channel at Apple (§8.3)
 )
+-- schema version 3: the scoreboard feed (§11):
+settings(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)  -- 'scoreboard.defaultAddress'
 ```
 
-The schema version is `PRAGMA user_version` (currently **2**). Migrations run at startup,
+The schema version is `PRAGMA user_version` (currently **3**). Migrations run at startup,
 each in one transaction; migration 2 also queues the channels of games that had already
 ended for deletion. A database with a newer version than the server knows is refused
 (an older server can't open a database a newer one has migrated).
@@ -313,6 +321,9 @@ length, **stopped**. A period with 0 minutes has no clock (`clock_ms = NULL`).
   "options": { "clockEnabled": true, "periodMinutes": 8, "overtimeMinutes": 4, "bestOf": null },
   "rules": { /* the SPORTS entry for this sport (incl. overtime.naming), with volleyball periods expanded for this game's bestOf */ },
   "scorekeeper": { "id": 3, "name": "Coach Smith" },   // null if unclaimed; only included for authenticated viewers, otherwise omitted
+  "scoreboard": { "setting": "default", "custom": null, "address": "10.20.1.50:10001", "eligible": true, "manual": false,
+                  "controlling": true, "state": "receiving", "message": "Score, clock and period come from the scoreboard.",
+                  "lastReadingAt": 1793571000000 },   // §11; only for authenticated viewers
   "canStartAt": 1793563200000,            // scheduledAt − START_WINDOW_MINUTES
   "startedAt": 1793570460000, "endedAt": null,
   "updatedAt": 1793571000000,
@@ -333,7 +344,7 @@ Base path `/api`. JSON in/out (`Content-Type: application/json`, body ≤ 64 KB)
 Every successful response includes `"serverTime": <unix ms>`.
 Errors: HTTP status + `{ "error": { "code": "snake_case", "message": "Human readable" }, "serverTime": … }`.
 Codes used: `bad_request` 400, `unauthorized` 401, `forbidden` 403, `not_found` 404,
-`conflict` 409, `too_early` 409, `rate_limited` 429 (with a `Retry-After` header), `internal` 500.
+`conflict` 409, `too_early` 409, `scoreboard_active` 409 (§11), `rate_limited` 429 (with a `Retry-After` header), `internal` 500.
 
 ### Authentication
 * `POST /api/auth/login` `{ username, password, client: "web" | "ios" }`
@@ -406,12 +417,15 @@ Codes used: `bad_request` 400, `unauthorized` 401, `forbidden` 403, `not_found` 
       state unchanged (re-anchors). Non-integral `remainingMs` is rounded.
     * `outs` `{ delta: 1 | -1 }` — baseball only (400 for other sports); see §5.
     * `note` `{ text: string }` — ≤ 40 chars after trim; `""` clears.
-    * `undo` `{}` — reverts the most recent not-undone scoring event of this game (`score`, `set_score`, `period`, `clock`, `outs`, `note`) by restoring its `prev_state`; 409 if nothing to undo (or that period no longer exists after an options edit).
+    * `undo` `{}` — reverts the most recent not-undone scoring event of this game (`score`, `set_score`, `period`, `clock`, `outs`, `note`) by restoring its `prev_state`; 409 if nothing to undo (or that period no longer exists after an options edit). Never reaches past a scoreboard update (§11): only events after the last one can be undone.
+  * While the scoreboard drives the game (§11, `scoreboard.controlling`), `score`, `set_score`, `period`, `clock` and `undo` → 409 `scoreboard_active`. Notes stay manual.
   * Every applied action: `version+1`, `updated_at=now`, insert `game_events`, emit SSE `game`, schedule an APNs update when the Lock Screen content changed (§8.2).
 * `POST /api/games/:id/end` → `{ game }` — holder or admin; `live` → `final` (409 otherwise), clock stopped, `note` cleared, `endedAt=now`, end push flow (§8).
+* `POST /api/games/:id/scoreboard` `{ manual: boolean }` → `{ game }` — holder or admin, `scheduled` or `live`: score this game by hand (the scoreboard feed pauses for it) or let the scoreboard drive it again (§11).
 
 ### Admin (role `admin`)
-* `POST /api/games` `{ sport, home:{name,code,color}, away:{name,code,color}, location, scheduledAt, options:{ clockEnabled?, periodMinutes?, overtimeMinutes?, bestOf? } }` → `{ game }`
+* `POST /api/games` `{ sport, home:{name,code,color}, away:{name,code,color}, location, scheduledAt, options:{ clockEnabled?, periodMinutes?, overtimeMinutes?, bestOf? }, scoreboard? }` → `{ game }`
+  * `scoreboard` (§11): `"default"` (the default), `"off"`, or the IP address of another scoreboard box, `"10.20.1.51"` or `"10.20.1.51:3001"` (IPv4/IPv6 literals only; port 10001 if omitted; 400 otherwise).
   * Validation: sport known; `home` optional (default: the `HOME_TEAM_*` team), `away` required; names 1–40 chars; codes 2–4 chars `[A-Z0-9]` (uppercased); colors `#RRGGBB`; `location` ≤ 100 chars; scheduledAt a number of ms (2000–2100); `periodMinutes` 1–60; `overtimeMinutes` 0–30; `bestOf` 3|5. Options that don't apply to the sport are validated but ignored. Missing options take the sport defaults.
 * `PATCH /api/games/:id` same fields, all optional → `{ game }`. Sport and team names/codes/colors are locked once the game has **started** (also after it ended: Live Activities carry them) → 409. Changing the sport resets the options to its defaults. For a live game, options that would leave the current period beyond the last one allowed → 409; the clock is brought in line with the new options.
 * `DELETE /api/games/:id` → `{ ok: true }` — not allowed while `live` (409; end or cancel it first, so its Live Activities get the end broadcast). Its channels are queued for deletion (§8.3).
@@ -422,6 +436,9 @@ Codes used: `bad_request` 400, `unauthorized` 401, `forbidden` 403, `not_found` 
 * `DELETE /api/users/:id` → `{ ok: true }`
 * `GET /api/admin/status` → `{ apns: { configured, environments, teamId, keyId, bundleId, error? }, devices: { production: { enabled, total, invalid }, sandbox: {…} }, recentPushes: [push_log rows, newest 50], sseClients }` (`error` only while APNs isn't configured)
 * `POST /api/admin/apns-check` → `{ results: { <env>: { ok, channelId?, error? } } }` — creates a test broadcast channel in each environment, reads it back, then deletes it. Verifies the key, team, bundle and broadcast capability end to end.
+* `GET /api/admin/scoreboard` → `{ defaultAddress: "<ip>:<port>" | null, feeds: [{ address, gameId, state, error, lastReadingAt }] }` (§11)
+* `PATCH /api/admin/scoreboard` `{ defaultAddress: "<ip>[:port]" | null | "" }` → same (400 on an invalid address; `null`/`""` clears it)
+* `POST /api/admin/scoreboard/test` `{ address }` → `{ result: { address, inUse, gameId?, connected, receiving, error, bytes, frames, badFrames, reading: { clockMs, clockRunning, home, away, period, sportCode, games? } } }` — listens to that scoreboard for a few seconds (up to ~10 s). If a live game is already reading it, describes that connection instead (`inUse: true`); the box accepts one connection at a time.
 
 ### 7.1 Server-Sent Events — `GET /api/stream`
 Headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache, no-transform`,
@@ -661,3 +678,102 @@ verified values the server must use.
   and hand passwords over with `--password-stdin` (the first line of stdin), never in
   argv, which every local user can read in `ps` / `/proc`. Without either, the CLI
   prompts on a terminal or generates and prints a password.
+
+## 11. Daktronics scoreboard feed
+
+The gym's Daktronics **All Sport 5000** console sends its "Enhanced RTD" (real-time data)
+out of its serial port; a **Lantronix** serial-to-Ethernet box (UDS1100, factory TCP port
+10001, serial 19200 8N1) puts it on the network. The server is a read-only TCP client of that
+box (`server/rtd.js` parses the stream, `server/scoreboard.js` runs the connections).
+
+**Which games.** An admin stores a default box address (`settings` row
+`scoreboard.defaultAddress`); each game has `scoreboard` = `default` | `off` | its own
+address. The feed drives a game only while it is **live**, its sport is **basketball or
+volleyball**, and its **home team is the school's team** (name or code equal to
+`HOME_TEAM_NAME` / `HOME_TEAM_CODE`). Of several live games on one box, the one **started
+last** wins (an earlier game someone forgot to end must not take the new game's scores); the
+others show `standby` and are switched to scoring by hand for good (`scoreboard_mode` event
+without a user, reason "a newer game took the scoreboard"), so they don't get the box - and the
+newer game's scores - back when it ends; only a scorekeeper's **Use the scoreboard** does that.
+If the winner is scored by hand, nobody gets the feed. A person still starts and ends every
+game.
+
+**What is read.** Only the score, the main clock and the period:
+
+| Field (1-based position, length) | Basketball | Volleyball |
+| --- | --- | --- |
+| 1, 5 — main clock `mm:ss` / `ss.t` (6, 8 `mm:ss.t` as a fallback) | game clock | (ignored: no clock in the app) |
+| 28, 1 — `s` = clock stopped, space = running | clock state | — |
+| 108, 4 / 112, 4 — home / guest score | game totals | points in the current game |
+| 142, 2 — period / game number | period (5 = 1st overtime …) | game (set) number |
+| 222 + 2(N−1), 2 / 242 + 2(N−1), 2 — home / guest score of game N | — | finished games' scores |
+
+Frames: `SYN "00000000" SOH header [STX data] EOT checksum ETB`; the header `004210NNNN` gives
+the data's 0-based position in the block (positions shifted by the console's RTD OFFSET
+setting are taken modulo 5000); the checksum is the sum of the bytes after SYN through EOT,
+mod 256, as two uppercase hex digits; frames with a bad checksum or another header are
+ignored. The console sends the clock every second and other fields only when they change (the
+whole block when the clock stops), so after (re)connecting a field is **unknown until a frame
+covers it** — an unknown score is never applied as 0. Sources: Daktronics ED-12483 and the
+AS5-Basketball / AS5-Volleyball data definitions; checked against captured streams and
+independent parsers.
+
+**Applying a reading** (`GameService.applyScoreboard`, one transaction, only when something
+changed): the period first (stepping like `period` actions: the clock resets, the note
+clears; periods past the game's last allowed one are ignored), then the score (points mode:
+the totals, the difference going into the current period like `set_score`; sets mode: the
+current game's points, and each finished game's score as the console recorded it unless it
+reads 0-0), then the clock — but only for a game with a clock in that period: it is set when
+it starts, stops or is set, or when a running clock is more than 1.5 s off (clients
+interpolate between updates, as with manual scoring). Each change is a `game_events` row of
+type `scoreboard` (no `prev_state`, not undoable; `undo` never goes past one) followed by the
+usual SSE event and APNs update; a reading that changes nothing writes nothing. Points
+mode reaches every total the console shows (a decrease comes off the current period, then
+earlier ones, then later ones left by a period stepped back). Frames arriving together are
+applied together (150 ms debounce, 500 ms at most).
+
+Guards against the console moving on before the app does:
+* **Console reset**: the console back at period/game 1 with lower scores (volleyball: game 1
+  at 0-0) while the game is further on means it was set up for the next game before this one
+  was ended. Nothing of it is applied; after 30 s the game is switched to scoring by hand
+  (reason "the scoreboard was reset for another game") with its score intact, for the
+  scorekeeper to end. If the scorekeeper then chooses **Use the scoreboard**, the check is
+  off for that game.
+* **Volleyball clear**: points cleared to 0-0 in the same game take the console's record of
+  that game when it has one; otherwise they are held for 20 s (for good on the match's last
+  set), so a finished set keeps its score when the operator clears the board before moving on.
+* **Volleyball beyond the match**: a game number past the match's last set is ignored, and so
+  are its points.
+
+**Screens.** Admin console → System: the default address, **Test connection** (what the
+box sends right now) and the live feeds; the game form: Use the default / Another scoreboard
+/ Off (basketball and volleyball only). Scorekeeper console (portal and iOS app): a
+"Scoreboard" panel with `scoreboard.message`, warning style for `unreachable` / `waiting`,
+and **Score by hand** / **Use the scoreboard** (before the start too). Queued actions the
+server refuses with `scoreboard_active` are dropped and reported; later notes still go
+through.
+
+**Scorekeepers.** While `scoreboard.controlling` is true the server rejects `score`,
+`set_score`, `period`, `clock` and `undo` (409 `scoreboard_active`); the portal and the app
+lock those controls and show `scoreboard.message`. `POST /api/games/:id/scoreboard
+{ manual: true }` (holder or admin) switches the game to scoring by hand; `{ manual: false }`
+hands it back. `controlling` stays true while the box is unreachable — switching to by-hand
+scoring is deliberate.
+
+**Status updates.** A change of feed status (connected, unreachable, ...) gets a new game
+`version` (not `updated_at`) and an SSE event, like any change. Whenever a change affects which
+game a box drives (status, `scoreboard`, the manual switch, sport, home team, start), the
+feed is re-decided before the change is published, so the response, the SSE event and the
+next action's 409 check agree. Changing the default address republishes every scheduled or
+live game on the default.
+
+**Connections.** Opened only while a game needs the feed, closed after; never written to
+(the Lantronix would pass the bytes into the console). TCP keepalive; reconnect after 2, 5,
+10, 20 then every 30 s (the backoff resets only once the box sends valid frames); reconnect
+after 90 s without data; `waiting` after 15 s without data. The reader drops garbage in linear
+time. Addresses are IPv4/IPv6 literals in one canonical form (IPv4-mapped IPv6 as IPv4, no
+zone ids, at most 64 characters).
+A reconnect, or another game taking over the box, starts from an empty block. The box accepts
+**one TCP connection at a time**: if another system (e.g. a Daktronics video system) holds it,
+the server is refused (`unreachable`, "connection refused"). `POST /api/admin/scoreboard/test`
+reuses the live connection when there is one.

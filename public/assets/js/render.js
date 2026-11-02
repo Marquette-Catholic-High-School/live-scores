@@ -23,6 +23,14 @@ export function isSetsMode(game) {
   return game.rules?.scoreMode === 'sets';
 }
 
+// What the Daktronics scoreboard sets for a game (ARCHITECTURE.md §11), in
+// the scorekeeper console's words: volleyball plays sets without a clock,
+// and a game with its clock turned off gets no clock.
+export function scoreboardFields(rules, clockEnabled) {
+  if (rules?.scoreMode === 'sets') return 'points and set';
+  return rules?.clock?.available && clockEnabled ? 'score, clock and period' : 'score and period';
+}
+
 // Sports played in half-innings (baseball) list their regulation periods as
 // alternating ▲/▼ entries; their line score groups two periods per inning.
 export function isHalfInnings(rules) {

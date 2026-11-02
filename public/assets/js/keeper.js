@@ -9,7 +9,7 @@ import { clockRemainingMs, formatClock, onTick, serverNow, splitClock } from './
 import { ActionQueue } from './queue.js';
 import {
   SIDES, finalLabel, hasStarted, isHalfInnings, isSetsMode, lineScoreTable, matchup, maxPeriodIndex, outsIndicator, periodInfoAt,
-  scoreLine, statusBadge, teamChip, updateTeamChip,
+  scoreLine, scoreboardFields, statusBadge, teamChip, updateTeamChip,
 } from './render.js';
 import { connectStream } from './sse.js';
 import { GameStore, coalesce } from './store.js';
@@ -45,6 +45,20 @@ const ACTION_NAMES = {
   undo: 'An undo',
 };
 
+// What the scoreboard sets while it drives a game (ARCHITECTURE.md §11): the
+// server refuses these then (409 scoreboard_active) and their controls are
+// locked. Notes, Start and End game stay with the scorekeeper.
+const FEED_ACTION_TYPES = new Set(['score', 'set_score', 'period', 'clock', 'undo']);
+
+const FEED_STATE_LABELS = {
+  connecting: 'Connecting',
+  unreachable: 'Can’t reach',
+  waiting: 'No data',
+  receiving: 'Receiving',
+  manual: 'By hand',
+  standby: 'Other game',
+};
+
 // Taps still waiting to be sent are kept in this tab's sessionStorage, so a
 // reload or the browser discarding the tab (iOS Safari never shows the
 // beforeunload prompt) doesn't lose them. They are resent with their
@@ -74,10 +88,36 @@ function restorePending() {
   else toast(`Sending ${restored} scoring ${restored === 1 ? 'change' : 'changes'} made before the page reloaded.`, { timeoutMs: 6000 });
 }
 
+// Taps queued before this device knew the scoreboard had taken over a game
+// (offline, or restored after a reload) are refused one after another. Like
+// any refused tap they are dropped; they are reported in one message.
+const FEED_REFUSAL_REPORT_MS = 600;
+const feedRefusals = new Map(); // gameId -> { count, timer }
+
+function reportFeedRefusal(error, item, dropped) {
+  let entry = feedRefusals.get(item.gameId);
+  if (!entry) {
+    entry = { count: 0, timer: null };
+    feedRefusals.set(item.gameId, entry);
+    refreshGame(item.gameId);
+  }
+  entry.count += 1 + dropped;
+  clearTimeout(entry.timer);
+  entry.timer = setTimeout(() => {
+    feedRefusals.delete(item.gameId);
+    const what = entry.count === 1 ? `${ACTION_NAMES[item.body.type] ?? 'A change'} wasn’t saved` : `${entry.count} changes weren’t saved`;
+    toast(`${what}: ${error.message}`, { tone: 'error', timeoutMs: 9000 });
+  }, FEED_REFUSAL_REPORT_MS);
+}
+
 const queue = new ActionQueue({
   onApplied: (result) => store.upsert(result.game),
   persist: savePending,
   onRejected: (error, item, dropped) => {
+    if (error.code === 'scoreboard_active') {
+      reportFeedRefusal(error, item, dropped);
+      return;
+    }
     const later = dropped > 0 ? ` ${dropped} later ${dropped === 1 ? 'change was' : 'changes were'} discarded — check the score.` : '';
     toast(`${ACTION_NAMES[item.body.type] ?? 'A change'} wasn’t saved: ${error.message}${later}`, { tone: 'error', timeoutMs: 9000 });
     refreshGame(item.gameId);
@@ -569,6 +609,11 @@ class ConsoleView {
     return user.role === 'admin' || this.game.scorekeeper?.id === user.id;
   }
 
+  // The scoreboard sets the score, clock and period right now.
+  feedLocked() {
+    return this.game.status === 'live' && Boolean(this.game.scoreboard?.controlling);
+  }
+
   // ---- building ----
 
   build() {
@@ -627,6 +672,22 @@ class ConsoleView {
     );
 
     ui.holder = el('div', { class: 'holder' });
+
+    // Scoreboard feed (ARCHITECTURE.md §11)
+    ui.feedState = el('span', { class: 'control__state' });
+    ui.feedText = el('p', { class: 'feed__text', 'aria-live': 'polite' });
+    ui.feedHint = el('p', { class: 'control__hint', text: 'Notes and End game stay with you. If the scoreboard is down or wrong, score by hand.' });
+    ui.feedManual = el('button', { type: 'button', class: 'btn', text: 'Score by hand', on: { click: (event) => this.setFeedManual(event.currentTarget, true) } });
+    ui.feedAuto = el('button', { type: 'button', class: 'btn btn--primary', text: 'Use the scoreboard', on: { click: (event) => this.setFeedManual(event.currentTarget, false) } });
+    ui.feedActions = el('div', { class: 'feed__actions' }, ui.feedManual, ui.feedAuto);
+    ui.feed = el('section', { class: 'control feed' }, el('h2', { class: 'control__title' }, 'Scoreboard', ui.feedState), ui.feedText, ui.feedHint, ui.feedActions);
+    // Controls the scoreboard takes over while it drives the game.
+    ui.feedLocks = [];
+    const feedLock = (node) => {
+      const lock = el('fieldset', { class: 'feed-lock' }, node);
+      ui.feedLocks.push(lock);
+      return lock;
+    };
 
     // Pre-game
     ui.start = el('button', { type: 'button', class: 'btn btn--go btn--xl btn--block', text: 'Start game', on: { click: () => this.start() } });
@@ -700,7 +761,7 @@ class ConsoleView {
       ui.clockBody = el('div', { class: 'clock-body' }, ui.clockDisplay, el('div', { class: 'clock-actions' }, ui.clockToggle, ui.clockSetOpen), ui.clockForm);
       ui.noClock = el('p', { class: 'control__hint', text: 'No game clock this period.' });
       ui.clock = el('section', { class: 'control control--clock' }, el('h2', { class: 'control__title' }, 'Game clock', ui.clockState), ui.clockBody, ui.noClock);
-      controls.push(ui.clock);
+      controls.push(feedLock(ui.clock));
     }
 
     // Period
@@ -710,7 +771,7 @@ class ConsoleView {
     ui.prev = el('button', { type: 'button', class: 'btn btn--lg period-btn', on: { click: () => this.period(-1) } }, el('span', { class: 'period-btn__dir', text: '‹ Back' }), ui.prevLabel);
     ui.next = el('button', { type: 'button', class: 'btn btn--lg btn--primary period-btn', on: { click: () => this.period(1) } }, el('span', { class: 'period-btn__dir', text: 'Next ›' }), ui.nextLabel);
     ui.periodNow = el('div', { class: 'period-now' });
-    controls.push(el('section', { class: 'control' }, el('h2', { class: 'control__title', text: periodWord }), el('div', { class: 'period-row' }, ui.prev, ui.periodNow, ui.next)));
+    controls.push(feedLock(el('section', { class: 'control' }, el('h2', { class: 'control__title', text: periodWord }), el('div', { class: 'period-row' }, ui.prev, ui.periodNow, ui.next))));
 
     // Outs (baseball)
     if (rules.tracksOuts) {
@@ -750,7 +811,12 @@ class ConsoleView {
     ui.fix.details.addEventListener('toggle', () => {
       if (ui.fix.details.open) ui.fix.prefill(this.game);
     });
-    controls.push(el('section', { class: 'control' }, el('h2', { class: 'control__title', text: 'Corrections' }), ui.undo, ui.fix.details));
+    // A disabled fieldset doesn't stop a <summary> from opening its form.
+    ui.fixSummary = ui.fix.details.querySelector('summary');
+    ui.fixSummary.addEventListener('click', (event) => {
+      if (this.feedLocked()) event.preventDefault();
+    });
+    controls.push(feedLock(el('section', { class: 'control' }, el('h2', { class: 'control__title', text: 'Corrections' }), ui.undo, ui.fix.details)));
 
     // End
     ui.end = el('button', { type: 'button', class: 'btn btn--danger btn--xl btn--block', text: 'End game', on: { click: () => this.end() } });
@@ -758,7 +824,7 @@ class ConsoleView {
     controls.push(el('section', { class: 'control control--end' }, ui.end, ui.endHint));
 
     ui.fieldset = el('fieldset', { class: 'console__fieldset' }, el('legend', { class: 'sr-only', text: 'Scoring controls' }),
-      el('div', { class: 'console__scoring' }, el('div', { class: 'pads' }, pad('home'), pad('away')), el('div', { class: 'console__controls' }, controls)));
+      el('div', { class: 'console__scoring' }, feedLock(el('div', { class: 'pads' }, pad('home'), pad('away'))), el('div', { class: 'console__controls' }, controls)));
     ui.scoring = ui.fieldset;
 
     // Final / canceled
@@ -773,7 +839,7 @@ class ConsoleView {
     ui.line = el('section', { class: 'console__line', 'aria-label': 'Line score' });
     ui.lineKey = '';
 
-    this.root.replaceChildren(head, ui.holder, ui.pregame, ui.scoring, ui.final, ui.line);
+    this.root.replaceChildren(head, ui.holder, ui.feed, ui.pregame, ui.scoring, ui.final, ui.line);
   }
 
   // ---- rendering ----
@@ -812,6 +878,7 @@ class ConsoleView {
     ui.final.hidden = !(game.status === 'final' || game.status === 'canceled');
 
     this.renderHolder();
+    this.renderFeed();
     if (game.status === 'scheduled') this.renderPregame();
     if (live) this.renderScoring();
     if (!ui.final.hidden) this.renderFinal();
@@ -863,6 +930,32 @@ class ConsoleView {
     clear(ui.holder, el('p', { class: 'holder__text', text }), buttons.length ? el('div', { class: 'holder__actions' }, buttons) : null);
   }
 
+  // Shown while the game will use, or uses, a scoreboard. Updated in place so
+  // the message is announced only when it changes.
+  renderFeed() {
+    const game = this.game;
+    const ui = this.ui;
+    const feed = game.scoreboard;
+    const before = game.status === 'scheduled';
+    ui.feed.hidden = !((before || game.status === 'live') && feed?.eligible && feed.setting !== 'off' && feed.address !== null);
+    if (ui.feed.hidden) return;
+    // Before the start the server's message says the scoreboard will be read,
+    // even for a game already switched to scoring by hand.
+    const state = before ? (feed.manual ? 'manual' : 'idle') : feed.state;
+    const text = before && feed.manual ? 'This game will be scored by hand. The scoreboard isn’t read.' : feed.message;
+    const canSwitch = this.canScore();
+    ui.feed.dataset.state = state;
+    ui.feedState.textContent = FEED_STATE_LABELS[state] ?? '';
+    ui.feedState.hidden = ui.feedState.textContent === '';
+    if (ui.feedText.textContent !== text) ui.feedText.textContent = text;
+    ui.feedHint.hidden = !(canSwitch && feed.controlling);
+    ui.feedManual.hidden = !(canSwitch && !feed.manual && (feed.controlling || before));
+    // A game a newer live game took the scoreboard from stays scored by hand
+    // until that game ends (§11): the server would release it again.
+    ui.feedAuto.hidden = !(canSwitch && feed.manual && state !== 'standby');
+    ui.feedActions.hidden = ui.feedManual.hidden && ui.feedAuto.hidden;
+  }
+
   renderPregame() {
     const game = this.game;
     const ui = this.ui;
@@ -886,6 +979,13 @@ class ConsoleView {
     const ui = this.ui;
     const { rules } = game;
     ui.fieldset.disabled = !this.canScore();
+    const locked = this.feedLocked();
+    for (const lock of ui.feedLocks) lock.disabled = locked;
+    ui.fixSummary.setAttribute('aria-disabled', String(locked));
+    if (locked) {
+      this.closeClockSet();
+      ui.fix.close();
+    }
 
     if (ui.clock) {
       ui.clock.hidden = !game.options.clockEnabled;
@@ -1009,6 +1109,7 @@ class ConsoleView {
 
   enqueue(action) {
     if (!this.game || this.game.status !== 'live' || !this.canScore()) return;
+    if (this.feedLocked() && FEED_ACTION_TYPES.has(action.type)) return;
     queue.enqueue(this.id, action);
   }
 
@@ -1122,6 +1223,46 @@ class ConsoleView {
     }
     this.enqueue(action);
     this.ui.fix.close();
+  }
+
+  // Score by hand (manual) or let the scoreboard drive the game again.
+  async setFeedManual(button, manual) {
+    const game = this.game;
+    const live = game.status === 'live';
+    if (!manual && live && queue.pendingFor(this.id).length) {
+      toast('Wait until every change is saved, then switch to the scoreboard.', { tone: 'error' });
+      return;
+    }
+    const fields = scoreboardFields(game.rules, game.options.clockEnabled);
+    let ok = true;
+    if (manual) {
+      ok = await confirmDialog({
+        title: 'Score this game by hand?',
+        body: [`The scoreboard won’t update this game’s ${fields} until you switch back with “Use the scoreboard”.`],
+        confirmLabel: 'Score by hand',
+      });
+    } else if (live) {
+      ok = await confirmDialog({
+        title: 'Use the scoreboard?',
+        body: [`The ${fields} follow the scoreboard again. What you entered by hand is replaced by what the scoreboard shows.`],
+        confirmLabel: 'Use the scoreboard',
+      });
+    }
+    if (!ok) return;
+    const ui = this.ui;
+    const result = await command(button, game.id, '/scoreboard', { manual });
+    if (!result) return;
+    // Say what came back: a newer live game that took the scoreboard in the
+    // meantime keeps this one scored by hand (§11).
+    const feed = result.game.scoreboard;
+    const switched = manual || (feed?.manual === false && feed.state !== 'standby');
+    if (switched) toast(manual ? 'Scoring by hand.' : 'Using the scoreboard.', { tone: 'success' });
+    else toast(feed?.state === 'standby' ? `Still scored by hand. ${feed.message}` : 'This game is still scored by hand.', { tone: 'error' });
+    if (this.destroyed) return;
+    // The button pressed makes way for the other one; keep the focus there.
+    this.update();
+    const other = manual ? ui.feedAuto : ui.feedManual;
+    if (this.ui === ui && !other.hidden) other.focus();
   }
 
   async takeOver(button) {

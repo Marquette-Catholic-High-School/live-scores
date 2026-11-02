@@ -3,8 +3,8 @@
 
 import { mountAccountMenu } from './account.js';
 import { ApiError, api, fetchConfig, fetchSession, gameApiPath, loginUrl } from './api.js';
-import { serverNow } from './clock.js';
-import { hasStarted, matchup, statusBadge, teamChip } from './render.js';
+import { formatClock, serverNow } from './clock.js';
+import { hasStarted, matchup, scoreboardFields, statusBadge, teamChip } from './render.js';
 import { connectStream } from './sse.js';
 import { GameStore, coalesce } from './store.js';
 import {
@@ -19,6 +19,19 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const ALL_SCOPE_LIMIT = 500;
 const DEFAULT_AWAY_COLOR = '#4B5563';
 const BEST_OF = [3, 5];
+// The sports the Daktronics scoreboard feed can drive (server/scoreboard.js).
+const SCOREBOARD_SPORTS = ['basketball', 'volleyball'];
+// Scoreboard feed states (ARCHITECTURE.md §11) as the games list and the
+// System tab name them; the others (unavailable, off, idle) aren't shown.
+const FEED_STATES = {
+  'no-address': 'no address set',
+  standby: 'used by a later game',
+  manual: 'scored by hand',
+  connecting: 'connecting',
+  unreachable: 'can’t reach it',
+  waiting: 'no data',
+  receiving: 'receiving',
+};
 
 const dom = {
   main: $('[data-admin]'),
@@ -29,7 +42,15 @@ const dom = {
 let user = null;
 let config = null;
 let sports = {};
+// GET /api/admin/scoreboard: the default scoreboard address (for the game
+// form) and the live feeds (System tab).
+let scoreboardSettings = null;
 const store = new GameStore();
+
+async function loadScoreboardSettings() {
+  scoreboardSettings = await api('/api/admin/scoreboard');
+  return scoreboardSettings;
+}
 
 function handleError(err, prefix = '') {
   if (err instanceof ApiError && err.status === 401) {
@@ -222,6 +243,67 @@ function gameFormDialog(game = null) {
       applySport({ keepGameOptions: true });
       sport.addEventListener('change', () => applySport({ keepGameOptions: sport.value === game?.sport }));
 
+      // The Daktronics scoreboard feed (ARCHITECTURE.md §11): the default
+      // scoreboard, another one, or off. Sent as "default" | "off" | address.
+      const feedName = uniqueId('scoreboard');
+      const feedChoice = (value, label) => {
+        const input = el('input', { type: 'radio', class: 'checkbox__input', name: feedName, value });
+        const text = el('span', { text: label });
+        return { input, text, root: el('label', { class: 'checkbox' }, input, text) };
+      };
+      const feedChoices = { default: feedChoice('default', 'Use the default scoreboard'), custom: feedChoice('custom', 'Another scoreboard'), off: feedChoice('off', 'Off') };
+      const feedAddress = textInput({ class: 'input input--mono', maxLength: 60, value: game?.scoreboard?.custom ?? '', placeholder: 'e.g. 10.20.1.51', autocapitalize: 'none' });
+      feedAddress.setAttribute('spellcheck', 'false');
+      const feedAddressField = field('IP address of its Lantronix box', feedAddress, { hint: 'Port 10001 unless you add another, e.g. 10.20.1.51:3001.', className: 'choices__more' });
+      const feedHomeHint = el('p', { class: 'field__hint', text: `The scoreboard is only used when ${config.homeTeam.name} is the home team.` });
+      const feedHint = el('p', { class: 'field__hint' });
+      const feedSet = el(
+        'fieldset',
+        { class: 'fieldset' },
+        el('legend', { text: 'Scoreboard' }),
+        feedHint,
+        el('div', { class: 'choices' }, feedChoices.default.root, feedChoices.custom.root, feedAddressField, feedChoices.off.root),
+        feedHomeHint,
+      );
+      const shownFeed = game?.scoreboard ? (game.scoreboard.setting === 'custom' ? game.scoreboard.custom : game.scoreboard.setting) : 'default';
+      (feedChoices[game?.scoreboard?.setting] ?? feedChoices.default).input.checked = true;
+      const feedValue = () => {
+        const choice = Object.values(feedChoices).find((c) => c.input.checked)?.input.value ?? 'default';
+        return choice === 'custom' ? feedAddress.value.trim() : choice;
+      };
+      const syncFeedDefault = () => {
+        feedChoices.default.text.textContent = scoreboardSettings
+          ? `Use the default scoreboard (${scoreboardSettings.defaultAddress ?? 'none set yet'})`
+          : 'Use the default scoreboard';
+      };
+      // Only basketball and volleyball, and only with the school's team at
+      // home (its name or code, as the server compares them). The hint says
+      // what the scoreboard sets for the sport and clock chosen.
+      const syncFeed = () => {
+        feedSet.hidden = !SCOREBOARD_SPORTS.includes(sport.value);
+        feedHint.textContent = `While the game is live, its ${scoreboardFields(sports[sport.value], clockOn.checked)} come from the gym’s Daktronics scoreboard.`;
+        const custom = feedChoices.custom.input.checked;
+        feedAddressField.hidden = !custom;
+        feedAddress.disabled = feedSet.hidden || !custom;
+        feedAddress.required = !feedAddress.disabled;
+        const team = home.value();
+        const ours = config.homeTeam;
+        const atHome = team.code === ours.code.toUpperCase() || team.name.toLowerCase() === ours.name.trim().toLowerCase();
+        feedHomeHint.hidden = atHome || feedChoices.off.input.checked;
+      };
+      syncFeedDefault();
+      syncFeed();
+      loadScoreboardSettings().then(syncFeedDefault, () => {});
+      sport.addEventListener('change', syncFeed);
+      clockOn.addEventListener('change', syncFeed);
+      home.root.addEventListener('input', syncFeed);
+      feedChoices.default.input.addEventListener('change', syncFeed);
+      feedChoices.off.input.addEventListener('change', syncFeed);
+      feedChoices.custom.input.addEventListener('change', () => {
+        syncFeed();
+        feedAddress.focus();
+      });
+
       // Times are read in the school's time zone; say which, and say so
       // plainly when this device is set to another zone (the abbreviation,
       // CST or CDT, depends on the date entered).
@@ -245,6 +327,7 @@ function gameFormDialog(game = null) {
         away.root,
         clockSet,
         setsSet,
+        feedSet,
         error,
       );
       const submit = el('button', { type: 'submit', class: 'btn btn--primary btn--lg', text: editing ? 'Save changes' : 'Create game', form: formId });
@@ -278,6 +361,7 @@ function gameFormDialog(game = null) {
           }
         }
         if (rules.scoreMode === 'sets') payload.options.bestOf = Number(bestOf.value);
+        if (!feedSet.hidden && (!editing || feedValue() !== shownFeed)) payload.scoreboard = feedValue();
 
         setBusy(submit, true);
         try {
@@ -315,7 +399,9 @@ class GamesPanel {
     this.filter = 'upcoming';
     this.loaded = false;
     this.error = null;
-    this.rowVersions = new Map();
+    // The game each row shows: the store holds a new object for every change
+    // (a new version; feed status changes get one too).
+    this.rowGames = new Map();
     this.rows = new Map();
     this.filterButtons = GAME_FILTERS.map(([value, label]) => el('button', {
       type: 'button',
@@ -377,16 +463,16 @@ class GamesPanel {
         row = el('li', { class: 'arow' });
         this.rows.set(game.id, row);
       }
-      if (this.rowVersions.get(game.id) !== game.version) {
+      if (this.rowGames.get(game.id) !== game) {
         this.fillRow(row, game);
-        this.rowVersions.set(game.id, game.version);
+        this.rowGames.set(game.id, game);
       }
       return row;
     });
     for (const id of [...this.rows.keys()]) {
       if (!store.get(id)) {
         this.rows.delete(id);
-        this.rowVersions.delete(id);
+        this.rowGames.delete(id);
       }
     }
     syncChildren(this.list, nodes);
@@ -402,6 +488,8 @@ class GamesPanel {
     const holder = game.scorekeeper;
     const mine = holder?.id === user.id;
     const team = (side) => el('span', { class: 'arow__team' }, teamChip(game[side]), el('span', { text: game[side].name }), started ? el('strong', { class: 'arow__score', text: String(game[side].score) }) : null);
+    const feed = game.status === 'live' ? game.scoreboard : null;
+    const feedState = feed ? FEED_STATES[feed.state] : undefined;
 
     const actions = [
       el('button', { type: 'button', class: 'btn btn--sm', text: 'Edit', on: { click: () => gameFormDialog(game) } }),
@@ -439,6 +527,7 @@ class GamesPanel {
           el('span', { text: game.sportName }),
           game.location ? el('span', { text: game.location }) : null,
           el('span', { class: 'arow__holder', text: holder ? `Scorekeeper: ${mine ? 'you' : holder.name}` : open ? 'Unclaimed' : 'No scorekeeper' }),
+          feedState ? el('span', { class: ['arow__feed', (feed.state === 'unreachable' || feed.state === 'waiting') && 'is-warn'], title: feed.message, text: `Scoreboard: ${feedState}` }) : null,
         ),
       ),
       el('div', { class: 'arow__actions' }, actions),
@@ -812,22 +901,215 @@ function keyValues(pairs) {
   return el('dl', { class: 'kv' }, pairs.filter(Boolean).map(([key, value]) => [el('dt', { text: key }), el('dd', {}, value)]));
 }
 
+const capitalize = (text) => text.charAt(0).toUpperCase() + text.slice(1);
+
+function checkItem(ok, ...text) {
+  return el(
+    'li',
+    { class: ['check-list__item', ok ? 'is-ok' : 'is-failed'] },
+    el('span', { class: 'check-list__icon', 'aria-hidden': 'true', text: ok ? '✓' : '✕' }),
+    el('span', {}, ...text),
+  );
+}
+
+// What a scoreboard test read (POST /api/admin/scoreboard/test). The sport
+// code is only sent with a full block, e.g. when the clock stops.
+function scoreboardReading(reading) {
+  const notYet = 'Not received yet';
+  const code = reading.sportCode;
+  const sport = code === null ? null : code >= 1000 && code < 2000 ? 'Basketball' : code >= 2000 && code < 3000 ? 'Volleyball' : `Other (code ${code})`;
+  const running = reading.clockRunning === null ? '' : reading.clockRunning ? ', running' : ', stopped';
+  return keyValues([
+    ['Clock', reading.clockMs === null ? notYet : `${formatClock(reading.clockMs)}${running}`],
+    ['Score', reading.home === null && reading.away === null ? notYet : `Home ${reading.home ?? '—'}, guest ${reading.away ?? '—'}`],
+    [sport === 'Volleyball' ? 'Set' : sport === 'Basketball' ? 'Period' : 'Period or set', reading.period === null ? notYet : String(reading.period)],
+    ['Sport', sport ?? 'Not known yet (sent when the clock stops)'],
+  ]);
+}
+
+// The Daktronics scoreboard feed (ARCHITECTURE.md §11): the default address
+// of the gym's Lantronix box, a connection test and the live feeds. Built
+// once and kept across the status refreshes, so typing isn't interrupted.
+class ScoreboardCard {
+  constructor() {
+    this.saved = null;
+    this.badge = el('span', { class: 'badge' });
+    this.input = textInput({ class: 'input input--mono', maxLength: 60, placeholder: 'e.g. 10.20.1.50', autocapitalize: 'none' });
+    this.input.setAttribute('spellcheck', 'false');
+    this.saveButton = el('button', { type: 'submit', class: 'btn btn--primary', text: 'Save' });
+    this.clearButton = el('button', { type: 'button', class: 'btn', text: 'Clear', disabled: true, on: { click: () => this.clear() } });
+    this.testButton = el('button', { type: 'button', class: 'btn', text: 'Test connection', on: { click: () => this.test() } });
+    this.error = el('p', { class: 'form-error', role: 'alert', hidden: true });
+    this.testResults = el('div', { class: 'check-results', 'aria-live': 'polite' });
+    this.feeds = el('div', {}, loadingState('Loading…'));
+    const form = el(
+      'form',
+      { class: 'stack', novalidate: true },
+      field('Default scoreboard address', this.input, { hint: 'The IP address of the scoreboard’s Lantronix box on the school network. Port 10001 unless the box was set up differently (e.g. 10.20.1.50:3001).' }),
+      el('div', { class: 'card__actions' }, this.saveButton, this.clearButton, this.testButton),
+      this.error,
+    );
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      this.save();
+    });
+    this.root = el(
+      'section',
+      { class: 'card' },
+      el('div', { class: 'card__head' }, el('h3', { class: 'card__title', text: 'Daktronics scoreboard' }), this.badge),
+      el('p', { class: 'card__text', text: `While a basketball or volleyball game with ${config.homeTeam.name} at home is live, its score, clock and period (for volleyball, the points and set) come from the gym’s scoreboard. The server only reads from the box, and the box accepts one connection at a time.` }),
+      form,
+      this.testResults,
+      el('h4', { class: 'card__subtitle', text: 'Live feeds' }),
+      this.feeds,
+    );
+  }
+
+  async load() {
+    try {
+      this.show(await loadScoreboardSettings());
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        location.assign(loginUrl());
+        return;
+      }
+      this.feeds.replaceChildren(errorNotice(`Couldn’t load the scoreboard settings: ${err.message}`, { retry: () => this.load() }));
+    }
+  }
+
+  // An address being typed is kept, unless it was just saved.
+  show(settings, { saved = false } = {}) {
+    scoreboardSettings = settings;
+    if (saved || this.input.value.trim() === (this.saved ?? '')) this.input.value = settings.defaultAddress ?? '';
+    this.saved = settings.defaultAddress;
+    this.badge.className = `badge ${this.saved ? 'badge--ok' : 'badge--canceled'}`;
+    this.badge.textContent = this.saved ? 'Set up' : 'Not set up';
+    if (!this.clearButton.hasAttribute('aria-busy')) this.clearButton.disabled = this.saved === null;
+    this.feeds.replaceChildren(this.feedTable(settings.feeds));
+  }
+
+  feedTable(feeds) {
+    if (feeds.length === 0) return el('p', { class: 'field__hint', text: 'No live game is reading a scoreboard right now.' });
+    return el('div', { class: 'table-wrap' }, el(
+      'table',
+      { class: 'table' },
+      el('thead', {}, el('tr', {}, ['Address', 'Game', 'State', 'Last reading'].map((h) => el('th', { scope: 'col', text: h })))),
+      el('tbody', {}, feeds.map((feed) => {
+        const game = store.get(feed.gameId);
+        return el(
+          'tr',
+          { class: feed.state === 'unreachable' ? 'is-failed' : null },
+          el('td', { class: 'mono', text: feed.address }),
+          el('td', {}, el('a', { href: `/keeper?game=${encodeURIComponent(feed.gameId)}`, text: game ? matchup(game) : feed.gameId })),
+          el('td', { class: 'wrap' }, el('span', { class: 'table__main', text: capitalize(FEED_STATES[feed.state] ?? feed.state) }), feed.error ? el('span', { class: 'table__sub', text: feed.error }) : null),
+          el('td', { text: feed.lastReadingAt ? formatTimestamp(feed.lastReadingAt) : '—' }),
+        );
+      })),
+    ));
+  }
+
+  async patch(button, defaultAddress, message) {
+    this.error.hidden = true;
+    setBusy(button, true);
+    try {
+      this.show(await api('/api/admin/scoreboard', { method: 'PATCH', body: { defaultAddress } }), { saved: true });
+      toast(message, { tone: 'success' });
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) location.assign(loginUrl());
+      this.error.textContent = err.message;
+      this.error.hidden = false;
+    } finally {
+      setBusy(button, false);
+      if (button === this.clearButton) button.disabled = this.saved === null;
+    }
+  }
+
+  save() {
+    const address = this.input.value.trim();
+    if (address === '') return this.clear();
+    return this.patch(this.saveButton, address, 'Default scoreboard saved.');
+  }
+
+  async clear() {
+    if (this.saved === null) {
+      this.input.value = '';
+      return;
+    }
+    const ok = await confirmDialog({
+      title: 'Clear the default scoreboard?',
+      body: ['Games set to use the default scoreboard won’t read one until an address is saved again.'],
+      confirmLabel: 'Clear',
+    });
+    if (ok) await this.patch(this.clearButton, null, 'Default scoreboard cleared.');
+  }
+
+  // Listens to the scoreboard for a few seconds (up to about 10).
+  async test() {
+    const address = this.input.value.trim() || this.saved;
+    if (!address) {
+      this.testResults.replaceChildren(el('p', { class: 'notice notice--warn', text: 'Enter the scoreboard’s IP address first.' }));
+      this.input.focus();
+      return;
+    }
+    setBusy(this.testButton, true);
+    this.testResults.replaceChildren(loadingState(`Listening to the scoreboard at ${address}… This takes up to 10 seconds.`));
+    try {
+      const { result } = await api('/api/admin/scoreboard/test', { method: 'POST', body: { address }, timeoutMs: 30_000 });
+      this.testResults.replaceChildren(this.testReport(result));
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        location.assign(loginUrl());
+        return;
+      }
+      this.testResults.replaceChildren(errorNotice(`The test didn’t finish: ${err.message}`));
+    } finally {
+      setBusy(this.testButton, false);
+    }
+    this.load();
+  }
+
+  testReport(result) {
+    const where = el('span', { class: 'mono', text: result.address });
+    const checks = [result.connected ? checkItem(true, 'Connected to ', where, '.') : checkItem(false, 'Couldn’t connect to ', where, `: ${result.error ?? 'no answer'}.`)];
+    if (result.connected && result.receiving) {
+      checks.push(checkItem(true, `Scoreboard data is coming in (${result.frames} ${result.frames === 1 ? 'update' : 'updates'}).`));
+    } else if (result.connected && result.frames > 0) {
+      // A live game's connection that has gone quiet.
+      checks.push(checkItem(false, 'No new data lately. Check that the scoreboard console is on.'));
+    } else if (result.connected && result.bytes > 0) {
+      checks.push(checkItem(false, 'Data came in, but it isn’t scoreboard data. Check the box’s serial settings.'));
+    } else if (result.connected) {
+      checks.push(checkItem(false, 'No data came in. Check that the scoreboard console is on and connected to the box.'));
+    }
+    const game = result.gameId ? store.get(result.gameId) : null;
+    return el(
+      'div',
+      { class: 'stack' },
+      result.inUse ? el('p', { class: 'notice notice--info', text: `In use by a live game (${game ? matchup(game) : result.gameId}). This is what that game’s connection has read.` }) : null,
+      el('ul', { class: 'check-list' }, checks),
+      result.frames > 0 ? scoreboardReading(result.reading) : null,
+    );
+  }
+}
+
 class SystemPanel {
   constructor(root) {
     this.root = root;
     this.timer = null;
     this.active = false;
     this.content = el('div', { class: 'stack stack--lg' }, loadingState('Loading status…'));
+    this.scoreboard = new ScoreboardCard();
+    this.pushes = el('section', { class: 'card', hidden: true });
     this.refreshButton = el('button', { type: 'button', class: 'btn', text: 'Refresh', on: { click: () => this.load() } });
     this.checkResults = el('div', { class: 'check-results', 'aria-live': 'polite' });
     root.append(
       el(
         'div',
         { class: 'panel-head' },
-        el('div', {}, el('h2', { class: 'panel-title', text: 'System' }), el('p', { class: 'page-sub', text: 'Lock Screen push setup, registered iPhones and recent pushes.' })),
+        el('div', {}, el('h2', { class: 'panel-title', text: 'System' }), el('p', { class: 'page-sub', text: 'Lock Screen push setup, registered iPhones, the gym scoreboard and recent pushes.' })),
         this.refreshButton,
       ),
-      this.content,
+      el('div', { class: 'stack stack--lg' }, this.content, this.scoreboard.root, this.pushes),
     );
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible' && this.active) this.load();
@@ -847,6 +1129,7 @@ class SystemPanel {
   async load() {
     clearTimeout(this.timer);
     setBusy(this.refreshButton, true);
+    this.scoreboard.load();
     try {
       const status = await api('/api/admin/status');
       this.render(status);
@@ -856,6 +1139,7 @@ class SystemPanel {
         return;
       }
       this.content.replaceChildren(errorNotice(`Couldn’t load the status: ${err.message}`, { retry: () => this.load() }));
+      this.pushes.hidden = true;
     } finally {
       setBusy(this.refreshButton, false);
       if (this.active) this.timer = setTimeout(() => { if (document.visibilityState === 'visible') this.load(); }, SYSTEM_REFRESH_MS);
@@ -958,11 +1242,10 @@ class SystemPanel {
       ))
       : emptyState('No pushes yet', 'Pushes appear here once a game starts.');
 
-    this.content.replaceChildren(
-      stats,
-      el('div', { class: 'card-grid' }, apnsCard, devicesCard),
-      el('section', { class: 'card' }, el('h3', { class: 'card__title', text: 'Recent pushes' }), pushTable),
-    );
+    this.content.replaceChildren(stats, el('div', { class: 'card-grid' }, apnsCard, devicesCard));
+    // The scoreboard card sits between these, untouched by the refresh.
+    this.pushes.replaceChildren(el('h3', { class: 'card__title', text: 'Recent pushes' }), pushTable);
+    this.pushes.hidden = false;
   }
 }
 

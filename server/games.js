@@ -6,7 +6,8 @@
 // effects (SSE, APNs) are triggered through `hooks` after the commit.
 
 import { randomInt } from 'node:crypto';
-import { badRequest, conflict, forbidden, notFound, tooEarly } from './errors.js';
+import { HttpError, badRequest, conflict, forbidden, notFound, tooEarly } from './errors.js';
+import { parseScoreboardSetting } from './scoreboard.js';
 import {
   defaultOptions,
   getSport,
@@ -34,6 +35,13 @@ const MAX_SCHEDULED_AT = Date.UTC(2100, 0, 1);
 
 export const UNDOABLE_TYPES = Object.freeze(['score', 'set_score', 'period', 'clock', 'outs', 'note']);
 export const ACTION_TYPES = Object.freeze([...UNDOABLE_TYPES, 'undo']);
+// What the scoreboard feed sets (§11); the scorekeeper can't change these by
+// hand while it drives the game. Notes stay manual.
+const SCOREBOARD_TYPES = Object.freeze(['score', 'set_score', 'period', 'clock', 'undo']);
+// A running clock may differ this much from the scoreboard before it is reset
+// to the scoreboard's time (the console sends whole seconds over a minute).
+const CLOCK_RESYNC_MS = 1500;
+export const CONSOLE_RESET_REASON = 'the scoreboard was reset for another game';
 const ACTION_ID_PATTERN = /^[\x21-\x7e]{8,64}$/;
 const SCOPES = ['board', 'all'];
 const ALL_SCOPE_LIMIT = 500;
@@ -66,6 +74,8 @@ function rowToGame(row) {
     clock: { ms: row.clock_ms, anchor: row.clock_anchor, running: row.clock_running === 1 },
     scorekeeperId: row.scorekeeper_id,
     scorekeeperName: row.scorekeeper_name ?? null,
+    scoreboard: row.scoreboard ?? 'default',
+    scoreboardManual: row.scoreboard_manual === 1,
     channels: { production: row.channel_production, sandbox: row.channel_sandbox },
     startedAt: row.started_at,
     endedAt: row.ended_at,
@@ -160,7 +170,7 @@ export function computeScores(game) {
   return { home: totals.home, away: totals.away, homeSet: null, awaySet: null };
 }
 
-function lastPeriodIndex(game) {
+export function lastPeriodIndex(game) {
   const max = maxPeriodIndex(game.sport, game.options);
   return max === null ? MAX_PERIODS - 1 : Math.min(max, MAX_PERIODS - 1);
 }
@@ -189,6 +199,92 @@ function movePeriod(game, delta, now) {
   game.outs = 0;
   game.note = '';
   resetClock(game, now);
+}
+
+// Points mode: sets a team's game total. An increase goes into the current
+// period; a decrease comes off the current period, then the earlier ones, then
+// any later ones (left behind when the console stepped the period back), so
+// every total the scoreboard shows can be reached.
+function setTeamTotal(line, period, team, target) {
+  const total = lineTotals(line)[team];
+  if (target >= total) {
+    line[period][team] += target - total;
+    return;
+  }
+  let left = total - target;
+  const order = [];
+  for (let i = period; i >= 0; i -= 1) order.push(i);
+  for (let i = line.length - 1; i > period; i -= 1) order.push(i);
+  for (const i of order) {
+    const taken = Math.min(line[i][team], left);
+    line[i][team] -= taken;
+    left -= taken;
+    if (left === 0) break;
+  }
+}
+
+// Makes the game show what the scoreboard shows (§11): period, score (points
+// mode: the totals; sets mode: points in the current game, plus each finished
+// game's score as the console recorded it) and the main clock. Values the
+// reading doesn't know (null) are left alone. Returns what changed, or null.
+function applyScoreboardReading(game, reading, now) {
+  const sport = getSport(game.sport);
+  const changes = {};
+  const known = (value) => value !== null && value !== undefined;
+
+  // The period first: moving resets the clock, which the reading then sets.
+  if (known(reading.period)) {
+    const target = reading.period - 1;
+    if (target !== game.period && target >= 0 && target <= lastPeriodIndex(game)) {
+      const step = target > game.period ? 1 : -1;
+      while (game.period !== target) movePeriod(game, step, now);
+      changes.period = target;
+    }
+  }
+
+  currentLineEntry(game);
+  if (sport.scoreMode === 'sets') {
+    const games = Array.isArray(reading.games) ? reading.games : [];
+    for (let i = 0; i < game.period && i < games.length; i += 1) {
+      const recorded = games[i];
+      // 0-0 means the console didn't record that game; keep what was seen live.
+      if (!recorded || (recorded.home === 0 && recorded.away === 0) || recorded.home > MAX_SCORE || recorded.away > MAX_SCORE) continue;
+      const entry = game.line[i];
+      if (entry.home === recorded.home && entry.away === recorded.away) continue;
+      entry.home = recorded.home;
+      entry.away = recorded.away;
+      (changes.games ??= {})[i] = [recorded.home, recorded.away];
+    }
+    // Points of a game the app isn't showing (the console is past the last
+    // set this match allows) must not land in the current set.
+    const sameGame = !known(reading.period) || reading.period - 1 === game.period;
+    const entry = game.line[game.period];
+    for (const [team, value] of [['home', reading.home], ['away', reading.away]]) {
+      if (!sameGame || !known(value) || value > MAX_SCORE || entry[team] === value) continue;
+      entry[team] = value;
+      changes[team] = value;
+    }
+  } else {
+    for (const [team, value] of [['home', reading.home], ['away', reading.away]]) {
+      if (!known(value) || value > MAX_SCORE) continue;
+      const before = lineTotals(game.line)[team];
+      if (value === before) continue;
+      setTeamTotal(game.line, game.period, team, value);
+      if (lineTotals(game.line)[team] !== before) changes[team] = value;
+    }
+  }
+
+  if (game.clock.ms !== null && known(reading.clockMs)) {
+    const ms = Math.min(reading.clockMs, MAX_CLOCK_MS);
+    const running = ms > 0 && (reading.clockRunning ?? game.clock.running);
+    const expected = clockRemainingMs(game.clock, now);
+    const differs = running !== game.clock.running || (running ? Math.abs(expected - ms) > CLOCK_RESYNC_MS : expected !== ms);
+    if (differs) {
+      game.clock = { ms, anchor: now, running };
+      changes.clock = { ms, running };
+    }
+  }
+  return Object.keys(changes).length > 0 ? changes : null;
 }
 
 // ---- input validation -------------------------------------------------------
@@ -343,6 +439,7 @@ export class GameService {
   #now;
   #log;
   #hooks;
+  #scoreboard = null;
 
   constructor({ db, config, now = Date.now, log, hooks = {} }) {
     this.#db = db;
@@ -354,6 +451,12 @@ export class GameService {
 
   setHooks(hooks) {
     this.#hooks = hooks;
+  }
+
+  // The scoreboard feed service (§11): decides which games it drives, and
+  // describes the feed in game JSON for signed-in viewers.
+  setScoreboard(scoreboard) {
+    this.#scoreboard = scoreboard;
   }
 
   #emit(name, ...args) {
@@ -419,6 +522,10 @@ export class GameService {
     return this.#db.all("SELECT id FROM games WHERE status = 'live'").map((row) => row.id);
   }
 
+  liveGames() {
+    return this.#db.all(`${GAME_SELECT} WHERE g.status = 'live'`).map(rowToGame);
+  }
+
   canStartAt(game) {
     return game.scheduledAt - this.#config.startWindowMinutes * 60_000;
   }
@@ -463,6 +570,7 @@ export class GameService {
     };
     if (authenticated) {
       json.scorekeeper = game.scorekeeperId === null ? null : { id: game.scorekeeperId, name: game.scorekeeperName };
+      if (this.#scoreboard) json.scoreboard = this.#scoreboard.view(game);
     }
     json.canStartAt = this.canStartAt(game);
     json.startedAt = game.startedAt;
@@ -481,12 +589,12 @@ export class GameService {
          sport = ?, home_name = ?, home_code = ?, home_color = ?, away_name = ?, away_code = ?, away_color = ?,
          location = ?, scheduled_at = ?, status = ?, period = ?, line = ?, outs = ?, note = ?, options = ?,
          clock_ms = ?, clock_anchor = ?, clock_running = ?, scorekeeper_id = ?, started_at = ?, ended_at = ?,
-         updated_at = ?, version = version + 1
+         scoreboard = ?, scoreboard_manual = ?, updated_at = ?, version = version + 1
        WHERE id = ?`,
       game.sport, game.home.name, game.home.code, game.home.color, game.away.name, game.away.code, game.away.color,
       game.location, game.scheduledAt, game.status, game.period, JSON.stringify(game.line), game.outs, game.note,
       JSON.stringify(game.options), game.clock.ms, game.clock.anchor, game.clock.running ? 1 : 0, game.scorekeeperId,
-      game.startedAt, game.endedAt, now, game.id,
+      game.startedAt, game.endedAt, game.scoreboard, game.scoreboardManual ? 1 : 0, now, game.id,
     );
     return this.getGame(game.id);
   }
@@ -510,6 +618,7 @@ export class GameService {
     if (input.scheduledAt === undefined || input.scheduledAt === null) throw badRequest('scheduledAt is required.');
     const scheduledAt = validateScheduledAt(input.scheduledAt);
     const options = resolveOptions(sport, input.options, defaultOptions(sport));
+    const scoreboard = input.scoreboard === undefined ? 'default' : parseScoreboardSetting(input.scoreboard);
     const now = this.#now();
 
     const game = this.#db.transaction(() => {
@@ -519,10 +628,10 @@ export class GameService {
       this.#db.run(
         `INSERT INTO games (id, sport, home_name, home_code, home_color, away_name, away_code, away_color, location,
                             scheduled_at, status, period, line, outs, note, options, clock_ms, clock_anchor, clock_running,
-                            created_by, created_at, updated_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', 0, '[]', 0, '', ?, NULL, NULL, 0, ?, ?, ?, 1)`,
+                            scoreboard, created_by, created_at, updated_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', 0, '[]', 0, '', ?, NULL, NULL, 0, ?, ?, ?, ?, 1)`,
         id, sport, home.name, home.code, home.color, away.name, away.code, away.color, location,
-        scheduledAt, JSON.stringify(options), user?.id ?? null, now, now,
+        scheduledAt, JSON.stringify(options), scoreboard, user?.id ?? null, now, now,
       );
       return this.getGame(id);
     });
@@ -559,6 +668,7 @@ export class GameService {
       }
       if (input.location !== undefined) next.location = validateLocation(input.location);
       if (input.scheduledAt !== undefined) next.scheduledAt = validateScheduledAt(input.scheduledAt);
+      if (input.scoreboard !== undefined) next.scoreboard = parseScoreboardSetting(input.scoreboard);
       if (input.options !== undefined) next.options = resolveOptions(next.sport, input.options, next.options);
 
       if (next.status === 'live') {
@@ -710,6 +820,9 @@ export class GameService {
       this.#assertHolder(current, user);
       correction = type === 'set_score' && user.role === 'admin' && current.status === 'final';
       if (current.status !== 'live' && !correction) throw conflict('This game is not live.');
+      if (SCOREBOARD_TYPES.includes(type) && this.#scoreboard?.controls(current)) {
+        throw new HttpError(409, 'scoreboard_active', 'The scoreboard is keeping score for this game. Switch to scoring by hand to change it yourself.');
+      }
 
       before = current;
       const next = cloneGame(current);
@@ -818,12 +931,15 @@ export class GameService {
         return { text };
       }
       case 'undo': {
+        // Never past a scoreboard update: the snapshot from before it would
+        // throw away everything the scoreboard set since.
         const event = this.#db.get(
           `SELECT id, type, prev_state FROM game_events
             WHERE game_id = ? AND undone = 0 AND prev_state IS NOT NULL
               AND type IN (${UNDOABLE_TYPES.map(() => '?').join(', ')})
+              AND id > COALESCE((SELECT MAX(id) FROM game_events WHERE game_id = ? AND type = 'scoreboard'), 0)
             ORDER BY id DESC LIMIT 1`,
-          game.id, ...UNDOABLE_TYPES,
+          game.id, ...UNDOABLE_TYPES, game.id,
         );
         if (!event) throw conflict('Nothing to undo.');
         const snapshot = JSON.parse(event.prev_state);
@@ -837,6 +953,80 @@ export class GameService {
       default:
         throw badRequest(`Unknown action type "${type}".`);
     }
+  }
+
+  // ---- scoreboard feed (§11) ----
+
+  // What the scoreboard shows, applied to a live game the feed drives.
+  applyScoreboard(id, reading) {
+    const now = this.#now();
+    let before = null;
+    const game = this.#db.transaction(() => {
+      const current = this.getGame(id);
+      if (!current || current.status !== 'live' || current.scoreboardManual) return null;
+      const next = cloneGame(current);
+      const changes = applyScoreboardReading(next, reading, now);
+      if (!changes) return null;
+      before = current;
+      this.#recordEvent(id, { type: 'scoreboard', data: changes, now });
+      return this.#save(next, now);
+    });
+    if (game) this.#emit('changed', before, game);
+    return game;
+  }
+
+  // The feed itself hands a game over to scoring by hand: a newer game took
+  // its scoreboard, or the console was reset for another game while this one
+  // was still live. `reason` goes into the event log.
+  releaseScoreboard(id, reason) {
+    let before;
+    const game = this.#db.transaction(() => {
+      before = this.getGame(id);
+      if (!before || before.status !== 'live' || before.scoreboardManual) return null;
+      const next = cloneGame(before);
+      next.scoreboardManual = true;
+      const now = this.#now();
+      this.#recordEvent(id, { type: 'scoreboard_mode', data: { manual: true, reason }, now });
+      return this.#save(next, now);
+    });
+    if (game) {
+      this.#log?.info('game switched to manual scoring by the scoreboard feed', { gameId: id, reason });
+      this.#emit('changed', before, game);
+    }
+    return game;
+  }
+
+  // True when a scorekeeper switched the game back to the scoreboard right
+  // after the feed released it because the console was reset (§11).
+  scoreboardResetOverridden(id) {
+    const [last, previous] = this.#db.all(
+      "SELECT user_id, data FROM game_events WHERE game_id = ? AND type = 'scoreboard_mode' ORDER BY id DESC LIMIT 2",
+      id,
+    );
+    if (!last || !previous || last.user_id === null || previous.user_id !== null) return false;
+    return JSON.parse(last.data).manual === false && JSON.parse(previous.data).reason === CONSOLE_RESET_REASON;
+  }
+
+  // The scorekeeper's switch between the scoreboard and scoring by hand.
+  setScoreboardManual(id, user, manual) {
+    const value = boolean(manual, 'manual');
+    let before;
+    const game = this.#db.transaction(() => {
+      before = this.#require(id);
+      this.#assertHolder(before, user);
+      if (before.status !== 'live' && before.status !== 'scheduled') throw conflict(`This game is ${before.status}.`);
+      if (before.scoreboardManual === value) return before;
+      const next = cloneGame(before);
+      next.scoreboardManual = value;
+      const now = this.#now();
+      this.#recordEvent(id, { userId: user.id, type: 'scoreboard_mode', data: { manual: value }, now });
+      return this.#save(next, now);
+    });
+    if (game !== before) {
+      this.#log?.info(value ? 'game switched to manual scoring' : 'game switched to the scoreboard', { gameId: id, by: user.id });
+      this.#emit('changed', before, game);
+    }
+    return game;
   }
 
   end(id, user, { auto = false } = {}) {

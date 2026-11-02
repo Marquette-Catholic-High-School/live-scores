@@ -1,4 +1,5 @@
-// /api/admin/* — push diagnostics for the admin console.
+// /api/admin/* — push diagnostics and the scoreboard feed settings for the
+// admin console.
 
 const ENVIRONMENTS = ['production', 'sandbox'];
 
@@ -15,7 +16,7 @@ function pushLogView(row) {
   };
 }
 
-export function registerAdminRoutes(router, { config, db, apns, sse }) {
+export function registerAdminRoutes(router, { config, db, apns, sse, scoreboard }) {
   router.get(
     '/api/admin/status',
     () => {
@@ -50,4 +51,21 @@ export function registerAdminRoutes(router, { config, db, apns, sse }) {
   );
 
   router.post('/api/admin/apns-check', async () => ({ results: await apns.check(config.apns.channelStoragePolicy) }), { auth: 'admin' });
+
+  // ---- Daktronics scoreboard (§11) ----
+
+  const scoreboardSettings = () => ({ defaultAddress: scoreboard.defaultAddress(), feeds: scoreboard.status() });
+
+  router.get('/api/admin/scoreboard', scoreboardSettings, { auth: 'admin' });
+
+  router.patch(
+    '/api/admin/scoreboard',
+    (ctx) => {
+      if (ctx.body.defaultAddress !== undefined) scoreboard.setDefaultAddress(ctx.body.defaultAddress);
+      return scoreboardSettings();
+    },
+    { auth: 'admin' },
+  );
+
+  router.post('/api/admin/scoreboard/test', async (ctx) => ({ result: await scoreboard.test(ctx.body.address) }), { auth: 'admin' });
 }
