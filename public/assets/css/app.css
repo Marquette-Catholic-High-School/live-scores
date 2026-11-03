@@ -494,6 +494,12 @@ hr { border: 0; border-top: 1px solid var(--border); margin: var(--space-1) 0; }
 /* Radio choices (.checkbox rows); a choice's own field sits under its label. */
 .choices { display: grid; gap: 2px; }
 .choices__more { padding: 2px 0 var(--space-2) calc(22px + var(--space-3)); }
+/* Side by side while they fit on one line. */
+.choices--inline { display: flex; flex-wrap: wrap; column-gap: var(--space-5); }
+
+/* Radio choices under one label: a fieldset without the box. */
+.choice-group { min-width: 0; margin: 0; padding: 0; border: 0; }
+.choice-group > legend { margin-bottom: 2px; padding: 0; }
 
 .form-grid {
   display: grid;
@@ -1829,6 +1835,10 @@ hr { border: 0; border-top: 1px solid var(--border); margin: var(--space-1) 0; }
   box-shadow: var(--shadow-sm);
 }
 
+/* A wide table scrolls in its .table-wrap rather than widening the card
+   (the scoreboard's live feeds at phone width). */
+.card > * { min-width: 0; }
+
 .card__head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-2); }
 .card__title { font-size: 1.0625rem; font-weight: 800; }
 .card__subtitle { margin: var(--space-2) 0 0; font-size: 0.9375rem; font-weight: 750; }
@@ -1869,6 +1879,29 @@ hr { border: 0; border-top: 1px solid var(--border); margin: var(--space-1) 0; }
 .check-list__item.is-ok { background: var(--ok-soft); color: var(--ok); }
 .check-list__item.is-failed { background: var(--danger-soft); color: var(--danger); }
 .check-list__icon { flex: none; font-weight: 900; }
+
+/* What to check after a failed test, in order. */
+.check-steps { display: grid; gap: var(--space-2); }
+.check-steps__title { font-weight: 700; }
+.check-steps__list { display: grid; gap: var(--space-3); margin: 0; padding-left: 1.5em; }
+.check-steps__list > li { padding-left: 4px; overflow-wrap: anywhere; }
+.check-steps__list .command { margin-top: 6px; }
+
+/* A shell command to copy, e.g. the scoreboard's firewall rule. */
+.command {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  padding: 8px 8px 8px 12px;
+  border-radius: 10px;
+  background: var(--surface-3);
+}
+
+.command__text { flex: 1 1 18em; min-width: 0; font: 600 0.875rem/1.5 var(--font-mono); overflow-wrap: anywhere; user-select: all; }
+
+/* A scoreboard's connection (TCP or UDP), address and firewall command. */
+.address-fields { display: grid; gap: var(--space-3); min-width: 0; }
 
 .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; -webkit-overflow-scrolling: touch; }
 .table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }

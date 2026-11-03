@@ -296,9 +296,13 @@ describe('Daktronics scoreboard feed', () => {
     try {
       const idle = await admin.post('/api/admin/scoreboard/test', { address: board.address });
       assert.equal(idle.status, 200);
+      assert.equal(idle.json.result.transport, 'tcp');
       assert.equal(idle.json.result.inUse, false);
       assert.equal(idle.json.result.connected, true);
       assert.equal(idle.json.result.receiving, true);
+      assert.equal(idle.json.result.closedByBox, false);
+      assert.equal(idle.json.result.error, null);
+      assert.ok(idle.json.result.listenedMs >= FAST.testSettleMs, `${idle.json.result.listenedMs} ms`);
       assert.equal(idle.json.result.reading.clockMs, 300_000);
       assert.equal(idle.json.result.reading.home, 1);
       await waitFor(() => board.open === 0, { message: 'the test closes its connection' });
@@ -310,6 +314,8 @@ describe('Daktronics scoreboard feed', () => {
       const shared = await admin.post('/api/admin/scoreboard/test', { address: board.address });
       assert.equal(shared.json.result.inUse, true);
       assert.equal(shared.json.result.gameId, game.id);
+      assert.equal(shared.json.result.transport, 'tcp');
+      assert.equal(shared.json.result.closedByBox, false);
       assert.equal(board.connections, before, 'no second connection to the box');
       await admin.post(`/api/games/${game.id}/end`, {});
     } finally {
@@ -317,7 +323,9 @@ describe('Daktronics scoreboard feed', () => {
     }
     const dead = await admin.post('/api/admin/scoreboard/test', { address: '127.0.0.1:1' });
     assert.equal(dead.json.result.connected, false);
-    assert.match(dead.json.result.error, /refused|no answer/);
+    assert.equal(dead.json.result.closedByBox, false);
+    assert.equal(dead.json.result.listenedMs, 0);
+    assert.match(dead.json.result.error, /connection refused: the box isn't accepting connections on this port\. It may use another port, send over UDP instead|no answer/);
   });
 });
 
@@ -450,6 +458,28 @@ describe('Daktronics scoreboard feed: review cases', () => {
     } finally {
       await fast.close();
       await new Promise((resolve) => flapping.close(resolve));
+    }
+  });
+
+  it('reports a box that ends or resets the test connection, keeping the error', async () => {
+    const boxes = [
+      net.createServer((socket) => setTimeout(() => socket.end(), 60)),
+      net.createServer((socket) => setTimeout(() => socket.resetAndDestroy(), 60)),
+    ];
+    for (const box of boxes) await new Promise((resolve) => box.listen(0, '127.0.0.1', resolve));
+    try {
+      for (const box of boxes) {
+        const res = await admin.post('/api/admin/scoreboard/test', { address: `127.0.0.1:${box.address().port}` });
+        const { result } = res.json;
+        assert.equal(result.transport, 'tcp');
+        assert.equal(result.connected, true);
+        assert.equal(result.closedByBox, true);
+        assert.equal(result.error, 'the box closed the connection');
+        assert.equal(result.receiving, false);
+        assert.ok(result.listenedMs >= 50 && result.listenedMs < FAST.testListenMs, `${result.listenedMs} ms`);
+      }
+    } finally {
+      for (const box of boxes) await new Promise((resolve) => box.close(resolve));
     }
   });
 

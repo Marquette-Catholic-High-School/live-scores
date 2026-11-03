@@ -57,8 +57,9 @@ toggle, which now also opts the device in/out of game Live Activities.
   `X-Forwarded-For` (the client is the last hop) and `X-Forwarded-Proto`.
 * **Scoreboard feed** (optional, §11): while a basketball or volleyball game with the
   school's team at home is live, the server reads the gym's Daktronics All Sport 5000
-  scoreboard through its Lantronix serial-to-Ethernet box (TCP client, read-only) and keeps
-  the game's score, clock and period in step.
+  scoreboard through its Lantronix serial-to-Ethernet box (read-only: a TCP client of the box,
+  or listening for the UDP datagrams it sends) and keeps the game's score, clock and period
+  in step.
 * **iOS**: SwiftUI app + WidgetKit extension. ActivityKit (iOS 18+ — the app's
   deployment target is 18.6, so broadcast channels are always available).
 
@@ -156,7 +157,7 @@ games(
   started_at INTEGER, ended_at INTEGER,
   created_by INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
   version INTEGER NOT NULL DEFAULT 1, -- +1 on every state change
-  scoreboard TEXT NOT NULL DEFAULT 'default',   -- schema 3, §11: 'default' | 'off' | '<ip>:<port>'
+  scoreboard TEXT NOT NULL DEFAULT 'default',   -- schema 3, §11: 'default' | 'off' | '<ip>:<port>' | 'udp://<ipv4>:<port>'
   scoreboard_manual INTEGER NOT NULL DEFAULT 0  -- schema 3, §11: 1 = the scorekeeper scores this game by hand
 )
 game_events(
@@ -425,7 +426,7 @@ Codes used: `bad_request` 400, `unauthorized` 401, `forbidden` 403, `not_found` 
 
 ### Admin (role `admin`)
 * `POST /api/games` `{ sport, home:{name,code,color}, away:{name,code,color}, location, scheduledAt, options:{ clockEnabled?, periodMinutes?, overtimeMinutes?, bestOf? }, scoreboard? }` → `{ game }`
-  * `scoreboard` (§11): `"default"` (the default), `"off"`, or the IP address of another scoreboard box, `"10.20.1.51"` or `"10.20.1.51:3001"` (IPv4/IPv6 literals only; port 10001 if omitted; 400 otherwise).
+  * `scoreboard` (§11): `"default"` (the default), `"off"`, or the address of another scoreboard box (§11 "Addresses"): over TCP `"10.20.1.51"`, `"10.20.1.51:3001"` or `"tcp://10.20.1.51"` (IPv4/IPv6 literals only; port 10001 if omitted; the Lantronix box's own ports → 400), over UDP `"udp://10.20.1.51"` or `"udp://10.20.1.51:21001"` (IPv4 only; port 21000 if omitted, 1024–65535). Stored and returned in canonical form; 400 otherwise.
   * Validation: sport known; `home` optional (default: the `HOME_TEAM_*` team), `away` required; names 1–40 chars; codes 2–4 chars `[A-Z0-9]` (uppercased); colors `#RRGGBB`; `location` ≤ 100 chars; scheduledAt a number of ms (2000–2100); `periodMinutes` 1–60; `overtimeMinutes` 0–30; `bestOf` 3|5. Options that don't apply to the sport are validated but ignored. Missing options take the sport defaults.
 * `PATCH /api/games/:id` same fields, all optional → `{ game }`. Sport and team names/codes/colors are locked once the game has **started** (also after it ended: Live Activities carry them) → 409. Changing the sport resets the options to its defaults. For a live game, options that would leave the current period beyond the last one allowed → 409; the clock is brought in line with the new options.
 * `DELETE /api/games/:id` → `{ ok: true }` — not allowed while `live` (409; end or cancel it first, so its Live Activities get the end broadcast). Its channels are queued for deletion (§8.3).
@@ -436,9 +437,13 @@ Codes used: `bad_request` 400, `unauthorized` 401, `forbidden` 403, `not_found` 
 * `DELETE /api/users/:id` → `{ ok: true }`
 * `GET /api/admin/status` → `{ apns: { configured, environments, teamId, keyId, bundleId, error? }, devices: { production: { enabled, total, invalid }, sandbox: {…} }, recentPushes: [push_log rows, newest 50], sseClients }` (`error` only while APNs isn't configured)
 * `POST /api/admin/apns-check` → `{ results: { <env>: { ok, channelId?, error? } } }` — creates a test broadcast channel in each environment, reads it back, then deletes it. Verifies the key, team, bundle and broadcast capability end to end.
-* `GET /api/admin/scoreboard` → `{ defaultAddress: "<ip>:<port>" | null, feeds: [{ address, gameId, state, error, lastReadingAt }] }` (§11)
-* `PATCH /api/admin/scoreboard` `{ defaultAddress: "<ip>[:port]" | null | "" }` → same (400 on an invalid address; `null`/`""` clears it)
-* `POST /api/admin/scoreboard/test` `{ address }` → `{ result: { address, inUse, gameId?, connected, receiving, error, bytes, frames, badFrames, reading: { clockMs, clockRunning, home, away, period, sportCode, games? } } }` — listens to that scoreboard for a few seconds (up to ~10 s). If a live game is already reading it, describes that connection instead (`inUse: true`); the box accepts one connection at a time.
+* `GET /api/admin/scoreboard` → `{ defaultAddress: "<ip>:<port>" | "udp://<ipv4>:<port>" | null, feeds: [{ address, gameId, state, error, lastReadingAt }] }` (§11)
+* `PATCH /api/admin/scoreboard` `{ defaultAddress: "[tcp://]<ip>[:port]" | "udp://<ipv4>[:port]" | null | "" }` → same (400 on an invalid address, with the reason; `null`/`""` clears it)
+* `POST /api/admin/scoreboard/test` `{ address }` (same forms) → `{ result }` — listens to that scoreboard for a few seconds (up to ~10 s) and reports what arrived (§11 "Test connection"):
+  `{ address, transport: "tcp" | "udp", inUse, gameId?, connected, receiving, error, bytes, frames, badFrames, reading: { clockMs, clockRunning, home, away, period, sportCode, games? }, listenedMs }`,
+  plus `closedByBox` over TCP and `datagrams`, `otherSources: [{ address, datagrams }]`, `firewallHint` over UDP.
+  If a live game is already reading that address, describes that feed instead (`inUse: true`, `gameId`): the box accepts one
+  TCP connection at a time; over UDP the test shares the port's socket with any feed on it.
 
 ### 7.1 Server-Sent Events — `GET /api/stream`
 Headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache, no-transform`,
@@ -683,8 +688,34 @@ verified values the server must use.
 
 The gym's Daktronics **All Sport 5000** console sends its "Enhanced RTD" (real-time data)
 out of its serial port; a **Lantronix** serial-to-Ethernet box (UDS1100, factory TCP port
-10001, serial 19200 8N1) puts it on the network. The server is a read-only TCP client of that
-box (`server/rtd.js` parses the stream, `server/scoreboard.js` runs the connections).
+10001, serial 19200 8N1) puts it on the network. The server reads it, never writes to it,
+either as a TCP client of the box or by listening for the UDP datagrams the box sends
+(`server/rtd.js` parses the stream, `server/scoreboard.js` runs the feeds,
+`server/scoreboard-udp.js` the UDP sockets).
+
+**Addresses.** The setting names the transport. Stored values are the canonical form, so
+one box gets one feed; values stored before UDP existed are all TCP and keep working.
+* **TCP** (the box is a TCP server on its Channel 1 "Local Port"): `10.20.1.50`,
+  `10.20.1.50:10001`, `fe80::5`, `[fe80::5]:10001`, each optionally with `tcp://` (scheme
+  case-insensitive) → `10.20.1.50:10001` / `[fe80::5]:10001`. Port 10001 if omitted.
+* **UDP** (the box sends datagrams; Daktronics usually sets Connect Mode CC, Datagram Type
+  01, often to the subnet broadcast address and UDP port 21000 so its own Data Monitor and
+  other PCs all receive them): `udp://10.20.1.50` or `udp://10.20.1.50:21000` →
+  `udp://10.20.1.50:21000`, meaning: listen on UDP port 21000 on every IPv4 interface of the
+  server and use only datagrams whose source IP is 10.20.1.50. Port 21000 if omitted. IPv4
+  only (an IPv4-mapped IPv6 literal becomes IPv4; any other IPv6 → 400 "A scoreboard that
+  sends over UDP needs an IPv4 address."). The port is the server's: 1024–65535 (the service
+  runs unprivileged, without `CAP_NET_BIND_SERVICE`).
+* **The Lantronix box's own ports** are refused for TCP with a 400 that says what the port is
+  and what to use instead ("Port 30718 is the Lantronix box's setup port and never sends
+  scoreboard data. Use the box's data port (Channel 1 "Local Port", 10001 unless it was
+  changed), or udp://<ip>:<port> if the box sends over UDP."): 30718 (77FEh, setup/discovery:
+  it accepts a TCP connection but only answers binary configuration requests), 30704 (GPIO),
+  9999 (Telnet setup), 14000–14009 (Com Port Redirector), 80 (web page). Not for UDP, where
+  the port is on the server.
+* IP literals only (the box has no DNS name), trimmed, at most 70 characters, no IPv6 zone
+  ids, IPv4-mapped IPv6 as IPv4. The same rules apply to the default address, a game's
+  `scoreboard` (create and update) and `POST /api/admin/scoreboard/test`.
 
 **Which games.** An admin stores a default box address (`settings` row
 `scoreboard.defaultAddress`); each game has `scoreboard` = `default` | `off` | its own
@@ -767,13 +798,57 @@ feed is re-decided before the change is published, so the response, the SSE even
 next action's 409 check agree. Changing the default address republishes every scheduled or
 live game on the default.
 
-**Connections.** Opened only while a game needs the feed, closed after; never written to
+**TCP connections.** Opened only while a game needs the feed, closed after; never written to
 (the Lantronix would pass the bytes into the console). TCP keepalive; reconnect after 2, 5,
 10, 20 then every 30 s (the backoff resets only once the box sends valid frames); reconnect
 after 90 s without data; `waiting` after 15 s without data. The reader drops garbage in linear
-time. Addresses are IPv4/IPv6 literals in one canonical form (IPv4-mapped IPv6 as IPv4, no
-zone ids, at most 64 characters).
-A reconnect, or another game taking over the box, starts from an empty block. The box accepts
-**one TCP connection at a time**: if another system (e.g. a Daktronics video system) holds it,
-the server is refused (`unreachable`, "connection refused"). `POST /api/admin/scoreboard/test`
-reuses the live connection when there is one.
+time. A reconnect, or another game taking over the box, starts from an empty block. The box
+accepts **one TCP connection at a time**: if another system (e.g. a Daktronics video system)
+holds it, the server is refused (`unreachable`, "connection refused: the box isn't accepting
+connections on this port. It may use another port, send over UDP instead, or already be
+connected to another system (it accepts one connection at a time)").
+`POST /api/admin/scoreboard/test` reuses the live connection when there is one.
+
+**UDP feeds.** One socket per port, bound without an address (on Linux a socket bound to an
+address never receives subnet broadcasts), shared by every feed and test on that port: each
+gets only the datagrams from its box's IP, so two boxes can send to one port. The socket is
+opened when the first feed or test needs the port and closed when the last one leaves (a
+game ending, scoring by hand, `stop()`). Datagram boundaries don't line up with RTD frames:
+every datagram from the box goes into the feed's one reader. **Nothing is ever sent** (no
+`send`, `connect` or `setBroadcast`): a datagram to the box goes out its serial port into the
+console, and a box with Remote IP 0.0.0.0 would redirect its output to the last sender, away
+from Daktronics' own PC. States (the same strings as over TCP, so the app needs nothing new):
+* `connecting` — binding the port: "Starting to listen for the scoreboard on UDP port 21000…";
+* `unreachable` — the port can't be bound (or the socket failed): "Can't listen for the
+  scoreboard on UDP port 21000: <error>. Retrying." (`EADDRINUSE` "another program on this
+  server is using that UDP port", `EACCES` "the server isn't allowed to use that port");
+  retried with the TCP backoff;
+* `waiting` — bound: "Listening on UDP port 21000, waiting for data from the scoreboard at
+  10.20.1.50.";
+* `receiving` — as over TCP.
+
+A UDP feed never reconnects: after 15 s without data it shows `waiting` again and keeps its
+socket and its block (only another game taking over the feed starts from an empty block).
+Nothing arrives unless the server's firewall lets it in: ufw's default deny silently drops
+unsolicited UDP, broadcasts included (`sudo ufw allow proto udp from <box-ip> to any port
+<port>`). A box whose netmask is the class default (/8 for 10.x) broadcasts to
+10.255.255.255, which a /24 Linux host doesn't deliver to its sockets.
+
+**Test connection** (`POST /api/admin/scoreboard/test`, admin console → System) listens for
+`testListenMs` (5 s) after connecting or binding, or until 2.5 s after the first valid frame,
+and returns `{ result }`:
+* every result: `address` (canonical), `transport` (`tcp` | `udp`), `inUse`, `gameId` (when
+  `inUse`), `connected`, `receiving` (valid frames arrived), `error`, `bytes`, `frames`,
+  `badFrames`, `reading`, `listenedMs` (how long it listened after connecting/binding; 0 if
+  it never did);
+* TCP: `closedByBox` — true when the box ended or reset the connection before the test was
+  done; `error` then says so ("the box closed the connection") although `connected` is true;
+* UDP: `connected` means the server is listening on the port; `datagrams` (from the box's
+  IP); `otherSources` — up to 5 other source IPs seen on that port during the test,
+  `[{ address, datagrams }]`, most datagrams first (a box sending from another address shows
+  up here); `firewallHint` — `"sudo ufw allow proto udp from 10.20.1.50 to any port 21000"`.
+
+If a live game's feed already uses that exact address, the result describes that feed
+(`inUse: true`; over UDP `otherSources` is then empty). A UDP test on a port a feed for a
+**different** box already has bound shares that socket: it never binds twice and never
+disturbs the feed.

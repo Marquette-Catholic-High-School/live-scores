@@ -1,22 +1,40 @@
 // Daktronics scoreboard feeds (ARCHITECTURE.md §11). While a basketball or
 // volleyball game with the school's team at home is live, the server reads the
-// scoreboard's RTD stream from its Lantronix box (a TCP server, by default on
-// port 10001) and keeps the game's score, clock and period in step with it.
+// scoreboard's RTD stream from its Lantronix box and keeps the game's score,
+// clock and period in step with it. The box is either a TCP server (by
+// default on port 10001) or sends UDP datagrams to the server
+// (scoreboard-udp.js).
 //
 // Read-only: nothing is ever written to the box - the Lantronix passes every
 // byte straight into the console. The box accepts one TCP connection at a
 // time, so the server connects only while a game needs the feed, shares that
 // connection with "Test connection", and reconnects with backoff.
 
+import dgram from 'node:dgram';
 import net from 'node:net';
 import { badRequest } from './errors.js';
 import { CONSOLE_RESET_REASON, computeScores, lastPeriodIndex } from './games.js';
 import { getSport } from './sports.js';
 import { RtdReader } from './rtd.js';
+import { UdpListeners } from './scoreboard-udp.js';
 
 export const SCOREBOARD_SPORTS = Object.freeze(['basketball', 'volleyball']);
 export const DEFAULT_SCOREBOARD_PORT = 10001;
+export const DEFAULT_UDP_PORT = 21000;
 const DEFAULT_ADDRESS_KEY = 'scoreboard.defaultAddress';
+// The Lantronix box's own ports: some accept a TCP connection, none carries
+// the console's data. [first, last, what it is]
+const RESERVED_TCP_PORTS = Object.freeze([
+  [30718, 30718, "the Lantronix box's setup port"],
+  [30704, 30704, "the box's GPIO control port"],
+  [9999, 9999, "the box's Telnet setup port"],
+  [14000, 14009, 'reserved for the Lantronix Com Port Redirector'],
+  [80, 80, "the box's web page"],
+]);
+// "Test connection" over UDP reports at most this many other senders, and
+// counts at most TRACKED_SOURCES of them.
+const OTHER_SOURCES = 5;
+const TRACKED_SOURCES = 64;
 
 const TIMING = Object.freeze({
   connectTimeoutMs: 5000,
@@ -39,18 +57,24 @@ const TIMING = Object.freeze({
   // on: it was reset for the next game before this one was ended.
   consoleResetHoldMs: 30_000,
 });
-// Longest valid input: a bracketed full IPv6 address with a port.
-const MAX_ADDRESS_LENGTH = 64;
+// Longest valid input: a scheme and a bracketed full IPv6 address with a port.
+const MAX_ADDRESS_LENGTH = 70;
 
-// "10.20.1.50", "10.20.1.50:10001", "fe80::5", "[fe80::5]:10001" ->
-// "10.20.1.50:10001" / "[fe80::5]:10001". IP addresses only: the box is on the
-// school network and has no DNS name.
+// TCP (the box is a server): "10.20.1.50", "10.20.1.50:10001", "fe80::5",
+// "[fe80::5]:10001", each also with "tcp://" -> "10.20.1.50:10001" /
+// "[fe80::5]:10001". UDP (the box sends to the server): "udp://10.20.1.50" or
+// "udp://10.20.1.50:21000" -> "udp://10.20.1.50:21000", meaning: listen on
+// UDP port 21000 and keep the datagrams from 10.20.1.50. IP addresses only:
+// the box is on the school network and has no DNS name.
 export function parseScoreboardAddress(value, field = 'address') {
-  const invalid = () => badRequest(`${field} must be an IP address such as 10.20.1.50 or 10.20.1.50:10001 (not a name).`);
+  const invalid = () =>
+    badRequest(`${field} must be an IP address such as 10.20.1.50 or 10.20.1.50:10001, or udp://10.20.1.50 for a box that sends over UDP (not a name).`);
   if (typeof value !== 'string' || value.trim().length > MAX_ADDRESS_LENGTH) throw invalid();
-  const text = value.trim();
+  const scheme = /^(tcp|udp):\/\//i.exec(value.trim());
+  const udp = scheme?.[1].toLowerCase() === 'udp';
+  const text = value.trim().slice(scheme ? scheme[0].length : 0);
   let host = text;
-  let port = DEFAULT_SCOREBOARD_PORT;
+  let port = udp ? DEFAULT_UDP_PORT : DEFAULT_SCOREBOARD_PORT;
   let match = /^\[([^\]]+)\](?::(\d{1,5}))?$/.exec(text);
   if (match) {
     host = match[1];
@@ -62,7 +86,7 @@ export function parseScoreboardAddress(value, field = 'address') {
   let family = net.isIP(host);
   // No IPv6 zone ids ("%eth0"): one spelling per box, so it gets one feed.
   if (family === 0 || host.includes('%')) throw invalid();
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw badRequest(`${field} has an invalid port (1-65535).`);
+  if (!udp && (!Number.isInteger(port) || port < 1 || port > 65535)) throw badRequest(`${field} has an invalid port (1-65535).`);
   if (family === 6) {
     // Canonical form: "0:0:0:0:0:0:0:1" -> "::1"; an IPv4-mapped address is the IPv4 one.
     host = new URL(`http://[${host}]/`).hostname.slice(1, -1);
@@ -76,13 +100,33 @@ export function parseScoreboardAddress(value, field = 'address') {
   } else {
     host = host.split('.').map(Number).join('.');
   }
+  if (udp) {
+    // The server listens on IPv4 only, and as an unprivileged service it can't
+    // bind ports below 1024.
+    if (family === 6) throw badRequest('A scoreboard that sends over UDP needs an IPv4 address.');
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+      throw badRequest(`${field} has an invalid UDP port: use one from 1024 to 65535 (the server can't listen on lower ports).`);
+    }
+    return `udp://${host}:${port}`;
+  }
+  const reserved = RESERVED_TCP_PORTS.find(([first, last]) => port >= first && port <= last);
+  if (reserved) {
+    throw badRequest(
+      `Port ${port} is ${reserved[2]} and never sends scoreboard data. Use the box's data port (Channel 1 "Local Port", 10001 unless it was changed), or udp://<ip>:<port> if the box sends over UDP.`,
+    );
+  }
   return family === 6 ? `[${host}]:${port}` : `${host}:${port}`;
 }
 
-function splitAddress(address) {
-  const match = /^\[(.+)\]:(\d+)$/.exec(address) ?? /^([^:]+):(\d+)$/.exec(address);
-  return { host: match[1], port: Number(match[2]) };
+// A normalized address's parts: { transport: 'tcp' | 'udp', host, port }.
+export function splitScoreboardAddress(address) {
+  const udp = address.startsWith('udp://');
+  const rest = udp ? address.slice('udp://'.length) : address;
+  const match = /^\[(.+)\]:(\d+)$/.exec(rest) ?? /^([^:]+):(\d+)$/.exec(rest);
+  return { transport: udp ? 'udp' : 'tcp', host: match[1], port: Number(match[2]) };
 }
+
+const firewallHint = (host, port) => `sudo ufw allow proto udp from ${host} to any port ${port}`;
 
 // A game's per-game setting as stored: 'default', 'off', or a normalized address.
 export function parseScoreboardSetting(value) {
@@ -108,10 +152,31 @@ function fieldsRead(game) {
   return game.options.clockEnabled ? 'Score, clock and period' : 'Score and period';
 }
 
+// The scorekeeper's status line for a feed's state (all but 'receiving').
+function feedMessage(state, address, error) {
+  const { transport, host, port } = splitScoreboardAddress(address);
+  if (transport === 'udp') {
+    return {
+      connecting: `Starting to listen for the scoreboard on UDP port ${port}…`,
+      unreachable: `Can't listen for the scoreboard on UDP port ${port}: ${error ?? 'the port could not be opened'}. Retrying.`,
+      waiting: `Listening on UDP port ${port}, waiting for data from the scoreboard at ${host}.`,
+    }[state];
+  }
+  return {
+    connecting: `Connecting to the scoreboard at ${address}…`,
+    unreachable: `Can't reach the scoreboard at ${address}: ${error ?? 'connection failed'}. Retrying.`,
+    waiting: `Connected to ${address}, waiting for data from the scoreboard console.`,
+  }[state];
+}
+
 function describeError(err) {
   switch (err?.code) {
     case 'ECONNREFUSED':
-      return 'connection refused (wrong port, or another system is already connected - the box accepts one connection at a time)';
+      return "connection refused: the box isn't accepting connections on this port. It may use another port, send over UDP instead, or already be connected to another system (it accepts one connection at a time)";
+    case 'EADDRINUSE':
+      return 'another program on this server is using that UDP port';
+    case 'EACCES':
+      return "the server isn't allowed to use that port";
     case 'ETIMEDOUT':
     case 'ESOCKETTIMEDOUT':
       return 'no answer (wrong IP address, the box is off, or the network blocks it)';
@@ -125,14 +190,18 @@ function describeError(err) {
   }
 }
 
-// One open (or retrying) connection to a scoreboard box.
+// One open (or retrying) connection to a scoreboard box; over UDP, the
+// datagrams from it on a port the server listens on.
 class Feed {
   constructor(service, address) {
     this.service = service;
     this.address = address;
+    ({ transport: this.transport, host: this.host, port: this.port } = splitScoreboardAddress(address));
     this.state = 'connecting';
     this.error = null;
     this.socket = null;
+    this.subscription = null;
+    this.datagrams = 0;
     this.reader = new RtdReader();
     this.attempt = 0;
     this.retryTimer = null;
@@ -148,10 +217,13 @@ class Feed {
   }
 
   open() {
-    if (this.closed || this.socket) return;
-    const { host, port } = splitAddress(this.address);
+    if (this.closed || this.socket || this.subscription) return;
+    if (this.transport === 'udp') {
+      this.listen();
+      return;
+    }
     const timing = this.service.timing;
-    const socket = this.service.connect({ host, port });
+    const socket = this.service.connect({ host: this.host, port: this.port });
     this.socket = socket;
     this.setState('connecting');
     socket.setTimeout(timing.connectTimeoutMs);
@@ -185,6 +257,36 @@ class Feed {
     });
   }
 
+  // UDP: listens on the port (one socket for every feed and test on it) for
+  // this box's datagrams. They don't line up with frames; the reader copes.
+  listen() {
+    const subscription = this.service.udp.subscribe(this.port, this.host, {
+      listening: () => {
+        this.connectedAt = this.service.now();
+        this.lastDataAt = null;
+        this.error = null;
+        this.setState('waiting');
+        this.service.log?.info('scoreboard listening', { address: this.address });
+      },
+      message: (chunk) => {
+        this.datagrams += 1;
+        this.onData(chunk);
+      },
+      error: (err) => {
+        if (this.subscription !== subscription) return;
+        this.subscription = null;
+        this.connectedAt = null;
+        this.error = describeError(err);
+        if (this.closed) return;
+        this.service.log?.warn("scoreboard can't listen", { address: this.address, error: this.error });
+        this.setState('unreachable');
+        this.scheduleRetry();
+      },
+    });
+    this.subscription = subscription;
+    this.setState('connecting');
+  }
+
   scheduleRetry() {
     if (this.closed || this.retryTimer) return;
     const delays = this.service.timing.retryDelaysMs;
@@ -193,7 +295,8 @@ class Feed {
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
       // Every reconnect starts from an empty block: the console doesn't resend.
-      this.reader = new RtdReader();
+      // (A UDP feed only retries binding its port, and keeps what it read.)
+      if (this.transport === 'tcp') this.reader = new RtdReader();
       this.open();
     }, delay);
     this.retryTimer.unref?.();
@@ -210,6 +313,11 @@ class Feed {
       this.socket = null;
       socket.destroy();
     }
+    if (this.subscription) {
+      const subscription = this.subscription;
+      this.subscription = null;
+      subscription.close();
+    }
   }
 
   // A new game takes over this scoreboard: what the console sent for the
@@ -218,6 +326,7 @@ class Feed {
     if (this.gameId === gameId) return;
     this.gameId = gameId;
     this.reader = new RtdReader();
+    this.datagrams = 0;
     this.volleyballReset = null;
     this.consoleReset = null;
     // The scorekeeper chose the scoreboard again after a reset was detected:
@@ -260,10 +369,12 @@ class Feed {
 
   tick(now) {
     const timing = this.service.timing;
-    if (!this.socket || this.connectedAt === null) return;
+    if (this.connectedAt === null) return;
     const since = this.lastDataAt ?? this.connectedAt;
     if (this.state === 'receiving' && now - since > timing.quietAfterMs) this.setState('waiting');
-    if (now - since > timing.reconnectAfterQuietMs) {
+    // A box sending over UDP has no connection to renew: it sends when the
+    // console does.
+    if (this.socket && now - since > timing.reconnectAfterQuietMs) {
       this.service.log?.warn('scoreboard silent; reconnecting', { address: this.address });
       this.error = 'no data from the scoreboard for a while';
       this.socket.destroy();
@@ -279,6 +390,7 @@ export class ScoreboardService {
   #assigned = new Map(); // address -> id of the live game the scoreboard drives
   #standby = new Map(); // id of a game waiting behind a newer one -> that game's id
   #tests = new Map(); // address -> in-flight test promise
+  #testsRunning = new Set(); // finish() of each in-flight test
   #onStatus;
   #ticker = null;
   #refreshTimer = null;
@@ -286,13 +398,24 @@ export class ScoreboardService {
   #refreshing = false;
   #refreshAgain = false;
 
-  constructor({ db, games, config, log, now = Date.now, connect = (options) => net.connect(options), timing = {}, onStatus = null }) {
+  constructor({
+    db,
+    games,
+    config,
+    log,
+    now = Date.now,
+    connect = (options) => net.connect(options),
+    createUdpSocket = () => dgram.createSocket({ type: 'udp4' }),
+    timing = {},
+    onStatus = null,
+  }) {
     this.#db = db;
     this.#games = games;
     this.#config = config;
     this.log = log;
     this.now = now;
     this.connect = connect;
+    this.udp = new UdpListeners({ createSocket: createUdpSocket });
     this.timing = { ...TIMING, ...timing };
     this.#onStatus = onStatus;
   }
@@ -321,6 +444,9 @@ export class ScoreboardService {
     this.#feeds.clear();
     this.#assigned.clear();
     this.#standby.clear();
+    // Tests in flight end with what they have; no socket outlives the service.
+    for (const finish of [...this.#testsRunning]) finish();
+    this.udp.closeAll();
   }
 
   // ---- settings ----
@@ -600,16 +726,11 @@ export class ScoreboardService {
       view.message = 'Scored by hand. The scoreboard feed is paused for this game.';
     } else if (!feed) {
       view.state = 'connecting';
-      view.message = `Connecting to the scoreboard at ${address}…`;
+      view.message = feedMessage('connecting', address, null);
     } else {
       view.state = feed.state;
       view.lastReadingAt = feed.lastReadingAt;
-      view.message = {
-        connecting: `Connecting to the scoreboard at ${address}…`,
-        unreachable: `Can't reach the scoreboard at ${address}: ${feed.error ?? 'connection failed'}. Retrying.`,
-        waiting: `Connected to ${address}, waiting for data from the scoreboard console.`,
-        receiving: `${fieldsRead(game)} come from the scoreboard.`,
-      }[feed.state];
+      view.message = feed.state === 'receiving' ? `${fieldsRead(game)} come from the scoreboard.` : feedMessage(feed.state, address, feed.error);
     }
     return view;
   }
@@ -631,14 +752,16 @@ export class ScoreboardService {
 
   // Listens to a scoreboard for a few seconds and reports what it sends. Uses
   // the feed's connection when a game is already reading this scoreboard (the
-  // box accepts one connection at a time).
+  // box accepts one connection at a time). Over UDP the test shares the port's
+  // socket with any feed on it, so it never disturbs one.
   test(value) {
     const address = parseScoreboardAddress(value);
     const feed = this.#feeds.get(address);
     if (feed) {
       const game = this.#games.getGame(feed.gameId);
-      return Promise.resolve({
+      const result = {
         address,
+        transport: feed.transport,
         inUse: true,
         gameId: feed.gameId,
         connected: feed.connectedAt !== null,
@@ -648,45 +771,51 @@ export class ScoreboardService {
         frames: feed.reader.dataFrames,
         badFrames: feed.reader.badFrames,
         reading: feed.reader.reading(game?.sport ?? 'basketball'),
-      });
+        listenedMs: feed.connectedAt === null ? 0 : Math.max(0, this.now() - feed.connectedAt),
+      };
+      if (feed.transport === 'udp') Object.assign(result, { datagrams: feed.datagrams, otherSources: [], firewallHint: firewallHint(feed.host, feed.port) });
+      else result.closedByBox = false;
+      return Promise.resolve(result);
     }
     let pending = this.#tests.get(address);
     if (!pending) {
-      pending = this.#listen(address).finally(() => this.#tests.delete(address));
+      pending = (address.startsWith('udp://') ? this.#listenUdp(address) : this.#listen(address)).finally(() => this.#tests.delete(address));
       this.#tests.set(address, pending);
     }
     return pending;
   }
 
   #listen(address) {
-    const { host, port } = splitAddress(address);
+    const { host, port } = splitScoreboardAddress(address);
     const reader = new RtdReader();
     return new Promise((resolve) => {
-      const result = { address, inUse: false, connected: false, receiving: false, error: null, bytes: 0, frames: 0, badFrames: 0, reading: null };
+      const result = { ...emptyResult(address, 'tcp'), closedByBox: false };
       let settle = null;
+      let listenTimer = null;
+      let connectedAt = null;
       let done = false;
       const socket = this.connect({ host, port });
       const finish = () => {
         if (done) return;
         done = true;
+        this.#testsRunning.delete(finish);
         clearTimeout(overall);
         clearTimeout(settle);
+        clearTimeout(listenTimer);
         socket.destroy();
-        result.bytes = reader.bytes;
-        result.frames = reader.dataFrames;
-        result.badFrames = reader.badFrames;
-        result.receiving = reader.dataFrames > 0;
-        const code = reader.reading('basketball').sportCode;
-        result.reading = reader.reading(code !== null && code >= 2000 && code < 3000 ? 'volleyball' : 'basketball');
-        resolve(result);
+        if (connectedAt !== null) result.listenedMs = Math.max(0, this.now() - connectedAt);
+        resolve(readResult(result, reader));
       };
+      this.#testsRunning.add(finish);
       const overall = setTimeout(finish, this.timing.connectTimeoutMs + this.timing.testListenMs);
       socket.setTimeout(this.timing.connectTimeoutMs);
       socket.once('connect', () => {
         result.connected = true;
+        connectedAt = this.now();
         socket.setTimeout(0);
         clearTimeout(overall);
-        setTimeout(finish, this.timing.testListenMs).unref?.();
+        listenTimer = setTimeout(finish, this.timing.testListenMs);
+        listenTimer.unref?.();
       });
       socket.on('data', (chunk) => {
         if (reader.push(chunk) > 0 && !settle) settle = setTimeout(finish, this.timing.testSettleMs);
@@ -697,9 +826,84 @@ export class ScoreboardService {
       });
       socket.on('error', (err) => {
         result.error = describeError(err);
+        if (result.connected && err.code === 'ECONNRESET') result.closedByBox = true;
         finish();
       });
-      socket.on('close', finish);
+      // Closed before the test was done: the box ended the connection.
+      socket.on('close', () => {
+        if (!done && result.connected && result.error === null) {
+          result.closedByBox = true;
+          result.error = describeError({ code: 'ECONNRESET' });
+        }
+        finish();
+      });
     });
   }
+
+  // UDP: listens on the port for the box's datagrams and counts the ones from
+  // anyone else (another box, or this one under another IP address).
+  #listenUdp(address) {
+    const { host, port } = splitScoreboardAddress(address);
+    const reader = new RtdReader();
+    const others = new Map(); // source IP -> datagrams
+    return new Promise((resolve) => {
+      const result = { ...emptyResult(address, 'udp'), datagrams: 0, otherSources: [], firewallHint: firewallHint(host, port) };
+      let settle = null;
+      let listenTimer = null;
+      let boundAt = null;
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        this.#testsRunning.delete(finish);
+        clearTimeout(overall);
+        clearTimeout(settle);
+        clearTimeout(listenTimer);
+        subscription.close();
+        if (boundAt !== null) result.listenedMs = Math.max(0, this.now() - boundAt);
+        result.otherSources = [...others]
+          .map(([source, datagrams]) => ({ address: source, datagrams }))
+          .sort((a, b) => b.datagrams - a.datagrams)
+          .slice(0, OTHER_SOURCES);
+        resolve(readResult(result, reader));
+      };
+      const overall = setTimeout(finish, this.timing.connectTimeoutMs + this.timing.testListenMs);
+      const subscription = this.udp.subscribe(port, host, {
+        listening: () => {
+          result.connected = true;
+          boundAt = this.now();
+          clearTimeout(overall);
+          listenTimer = setTimeout(finish, this.timing.testListenMs);
+          listenTimer.unref?.();
+        },
+        message: (chunk) => {
+          result.datagrams += 1;
+          if (reader.push(chunk) > 0 && !settle) settle = setTimeout(finish, this.timing.testSettleMs);
+        },
+        other: (source) => {
+          if (others.has(source) || others.size < TRACKED_SOURCES) others.set(source, (others.get(source) ?? 0) + 1);
+        },
+        error: (err) => {
+          result.error = describeError(err);
+          finish();
+        },
+      });
+      this.#testsRunning.add(finish);
+    });
+  }
+}
+
+function emptyResult(address, transport) {
+  return { address, transport, inUse: false, connected: false, receiving: false, error: null, bytes: 0, frames: 0, badFrames: 0, reading: null, listenedMs: 0 };
+}
+
+// What a test's reader got, into its result.
+function readResult(result, reader) {
+  result.bytes = reader.bytes;
+  result.frames = reader.dataFrames;
+  result.badFrames = reader.badFrames;
+  result.receiving = reader.dataFrames > 0;
+  const code = reader.reading('basketball').sportCode;
+  result.reading = reader.reading(code !== null && code >= 2000 && code < 3000 ? 'volleyball' : 'basketball');
+  return result;
 }

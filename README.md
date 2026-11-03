@@ -93,7 +93,9 @@ port is needed except SSH. Section 5.3 lists the outbound changes.
 
 The installer configures `ufw` on the VM to exactly this (SSH restricted with
 `--ssh-from`, otherwise rate-limited). If your cloud has its own firewall or security
-group, open the same ports there too: the installer can't change those.
+group, open the same ports there too: the installer can't change those. If the gym's
+scoreboard box sends its data over UDP (section 8.1), you add one more rule yourself, for
+that box's address only; re-running the installer keeps it.
 
 ### Outbound (from the VM)
 
@@ -535,26 +537,105 @@ sends anything to the box.
 
 1. Find the Lantronix box's IP address on the school network and make sure the VM can
    reach it (same network, or a route/VLAN to it - Daktronics often puts its equipment on
-   its own 192.168.x.x network behind a router). The box listens on **TCP port 10001**
-   unless it was set up differently, and its serial port must be set to 19200 baud, 8 data
-   bits, no parity, 1 stop bit (the Daktronics setting for All Sport data). Test from the
-   VM with `nc -v <ip> 10001` (you should see characters scroll while the console is on).
-2. In the portal: **Admin → System → Daktronics scoreboard**, enter the address (e.g.
-   `10.20.1.50`, or `10.20.1.50:3001` for another port), **Save**, then **Test
-   connection**. With the console on, it shows the clock, score and period it reads.
-3. New games use this default scoreboard. In a game's form you can pick **another
+   its own 192.168.x.x network behind a router). Its serial port must be set to 19200 baud,
+   8 data bits, no parity, 1 stop bit (the Daktronics setting for All Sport data).
+2. Give the box an address that doesn't change: a **DHCP reservation** for its MAC address
+   (printed on the box's label) on the school's DHCP server, unless Daktronics set a fixed
+   IP on the box. Otherwise the box can get another address after a power cut and the
+   feed stops (over UDP, **Test connection** then lists the new address under the other
+   senders).
+3. Find out whether the box sends over **TCP or UDP** (below).
+4. **UDP only**: allow the box's datagrams through the VM's firewall (below).
+5. In the portal: **Admin → System → Daktronics scoreboard**, enter the address, **Save**,
+   then **Test connection**. With the console on, it shows the clock, score and period it
+   reads.
+   * TCP: `10.20.1.50` (port 10001), or `10.20.1.50:3001` for another port.
+   * UDP: `udp://10.20.1.50` (UDP port 21000), or `udp://10.20.1.50:21001` for another
+     port: the box's IP address and the UDP port it sends to. IPv4 only, port 1024 or
+     higher.
+6. New games use this default scoreboard. In a game's form you can pick **another
    scoreboard** (e.g. a second gym) or turn it **off** for that game.
 
-The box accepts only **one connection at a time**. If another system already uses it
-(for example a Daktronics video or graphics system), the test says "connection refused".
-Then either that system or the server can read it, not both.
+Ports 30718, 30704, 9999, 14000-14009 and 80 belong to the box itself (setup, GPIO,
+Telnet setup, Com Port Redirector, its web page) and never carry scoreboard data, so the
+portal refuses them. Port 30718 is the trap: it accepts a connection and then sends
+nothing.
+
+**TCP or UDP?**
+
+A Lantronix box either waits for a computer to connect to it (**TCP**, on its Channel 1
+"Local Port", 10001 by default) or sends everything the console outputs as **UDP**
+datagrams to one computer or to the whole subnet. Daktronics often sets it up the second
+way, broadcasting to UDP port 21000, so its own Data Monitor and other PCs all get the
+data. A box that refuses TCP on port 10001 ("connection refused") is usually sending over
+UDP. Three ways to find out, none of which changes anything:
+
+* **The box's web page.** From a computer on the same network, open `http://<box ip>` and
+  go to **Channel 1 → Connection**. *Protocol TCP* means TCP on the Local Port shown.
+  *Protocol UDP* means UDP: the *Remote Port* is the port to enter, and the *Remote
+  Host/IP* is where it sends (the VM's address, a broadcast address ending in `.255`, or
+  another PC). **Only look.** Clicking **Apply Settings**, even without changing anything,
+  reboots the box and cuts the video board's feed - never during an event, and change
+  settings only together with Daktronics.
+* **tcpdump on the VM**, with the console on:
+  ```bash
+  sudo tcpdump -ni any -c 20 host 10.20.1.50
+  ```
+  It stops after 20 packets (Ctrl+C stops it sooner).
+  * Lines ending in `IP 10.20.1.50.10001 > 10.20.1.255.21000: UDP, length 40`, about every
+    second: the box sends over UDP. The number after the last dot of the destination is
+    the port to use (`udp://10.20.1.50:21000`); the destination address before it is where
+    the box sends (here the subnet's broadcast address, which reaches the VM). tcpdump
+    sees packets before the firewall, so they show up here even while ufw still drops
+    them.
+  * The destination is `10.255.255.255`: see the netmask note below.
+  * Nothing at all for half a minute: the box sends nothing the VM can see over UDP (it is
+    a TCP server, or sends only to one other PC - a switch delivers that to that PC alone).
+    Try TCP while tcpdump runs: `nc -v 10.20.1.50 10001`. `Flags [S.]` back from the box
+    means it accepts TCP connections (and `nc` shows characters scrolling); `Flags [R.]`
+    means it refuses them on that port.
+* **Daktronics Data Monitor.** If a school PC (for example the video control PC) runs
+  Daktronics' Data Monitor, its **Transmissions** tab shows how that PC receives the
+  scoreboard data: a UDP port it listens on, or a TCP connection to the box's address and
+  port.
+
+If the box sends over UDP only to one particular PC, the VM can't receive it. Ask
+Daktronics to send to the subnet's broadcast address instead (so their PC and the VM both
+get it) rather than to the VM alone, which would take the data away from their PC.
+
+**Firewall (UDP only)**
+
+The VM's firewall (ufw, default deny incoming) silently drops the box's datagrams,
+broadcasts included. Allow them from the box only, on the port it sends to:
+
+```bash
+sudo ufw allow proto udp from 10.20.1.50 to any port 21000
+```
+
+**Test connection** shows this command with your box's address and port. Re-running the
+installer keeps this rule: its firewall step only ever deletes ufw rules it recorded adding
+itself (as does `uninstall.sh --close-ports`). TCP needs no rule: the server connects out
+to the box.
+
+**Netmask note.** If tcpdump shows the datagrams going to `10.255.255.255`, the box's
+subnet mask is the class default (255.0.0.0 for a 10.x address) instead of the network's
+(usually 255.255.255.0). The VM, on a /24 network, receives those packets (tcpdump shows
+them) but Linux doesn't hand them to the server. Ask Daktronics to set the box's subnet
+mask to match the network, so it broadcasts to the subnet (e.g. `10.20.1.255`).
+
+**One connection at a time (TCP).** A box that is a TCP server accepts only **one
+connection at a time**. If another system already uses it (for example a Daktronics video
+or graphics system), the test says "connection refused". Then either that system or the
+server can read it, not both. Over UDP there's no such limit: every computer the box's
+datagrams reach can read them.
 
 **On game day**
 
 * A person still claims and starts the game; once it is live the server connects to
-  the scoreboard. The scorekeeper console (portal and app) shows the scoreboard status,
-  and the score, clock, period and undo buttons are locked: the scoreboard wins. Notes
-  (Timeout, Halftime, ...) and **End game** stay with the scorekeeper.
+  the scoreboard (or, over UDP, starts listening for it). The scorekeeper console (portal
+  and app) shows the scoreboard status, and the score, clock, period and undo buttons are
+  locked: the scoreboard wins. Notes (Timeout, Halftime, ...) and **End game** stay with
+  the scorekeeper.
 * Right after connecting, the score appears as soon as it changes on the scoreboard or
   the operator stops the clock (the console only sends what changes).
 * If the scoreboard is wrong or can't be reached, tap **Score by hand**: the feed pauses
@@ -566,7 +647,7 @@ Then either that system or the server can read it, not both.
 * If the operator resets the scoreboard for the next game before this one was ended,
   the server doesn't copy the reset: after 30 seconds the game switches to scoring by
   hand with its final score intact, ready to be ended.
-* When the game ends, the server disconnects from the box.
+* When the game ends, the server disconnects from the box (over UDP, it stops listening).
 
 ## 9. Verify APNs
 
@@ -836,13 +917,42 @@ checks this. Clients reconnect on their own after any interruption.
 
 ### The scoreboard feed doesn't update a game
 
-The scorekeeper console shows the reason under "Scoreboard":
-* *Can't reach the scoreboard ... connection refused*: wrong port, or another system
+The scorekeeper console shows the reason under "Scoreboard"; **Admin → System → Test
+connection** gives more detail:
+* *Can't reach the scoreboard ... connection refused*: the box isn't accepting TCP
+  connections on that port. Most often it sends over UDP instead (find out as in section
+  8.1 "TCP or UDP?", then enter `udp://<ip>:<port>`); otherwise the port is wrong (the
+  data port is Channel 1's Local Port, 10001 unless it was changed) or another system
   already holds the box's one connection. *no answer*: wrong IP address, the box is off,
   or the VM can't reach that network. Test from the VM: `nc -v <ip> 10001`.
+* "Port 30718 is the Lantronix box's setup port" (or 30704, 9999, 14000-14009, 80) when
+  saving or testing an address: that port belongs to the box itself and never sends
+  scoreboard data (30718 accepts a connection, which is why it could look connected). Use
+  the data port, or `udp://` if the box sends over UDP.
+* *the box closed the connection* in a test that did connect: the box (or a firewall in
+  between) ended the connection before the test was done. Check the port, and whether the
+  box sends over UDP instead.
 * *Connected, waiting for data*: the console is off, or the Lantronix serial settings
   don't match (19200 8N1), or the cable is wrong (Daktronics: a null-modem cable from the
   console's J6 port). Random characters with `nc` mean a baud-rate mismatch.
+* *Listening on UDP port ..., waiting for data from the scoreboard at ...*: nothing from
+  the box gets through. Check in this order:
+  1. The console is on and sending (the video board updates).
+  2. The firewall: `sudo ufw status` must list the allow rule from section 8.1 for that
+     address and port (**Test connection** shows the exact command).
+  3. What arrives: `sudo tcpdump -ni any -c 20 host <box ip>`, then
+     `sudo tcpdump -ni any -c 20 udp port <port>`. From the box to your port but not in
+     the portal: the firewall (2), or they go to `10.255.255.255` (netmask note in 8.1).
+     From the box to another port: enter that port. To your port from another address:
+     the box's IP changed (**Test connection** lists other senders too); update the
+     address and set up the DHCP reservation. Nothing from the box: check where it sends
+     (Remote Host and Remote Port on its web page, look only) - it may send to one other
+     PC or to another subnet.
+* *Can't listen for the scoreboard on UDP port ...: another program on this server is
+  using that UDP port*: `sudo ss -ulpn 'sport = :21000'` shows which program; stop it, or
+  have Daktronics point the box at another port and enter that one. *the server isn't
+  allowed to use that port*: a security policy on the VM keeps the service off that port;
+  use another one from 1024 up.
 * *The scoreboard is driving another game*: two live games point at the same scoreboard;
   end the older one.
 * Not shown at all: the game isn't basketball or volleyball, Marquette isn't the home team,

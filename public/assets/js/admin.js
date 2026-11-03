@@ -32,6 +32,9 @@ const FEED_STATES = {
   waiting: 'no data',
   receiving: 'receiving',
 };
+// A scoreboard that sends over UDP isn't connected to: the server listens.
+const UDP_FEED_STATES = { connecting: 'starting to listen', unreachable: 'can’t listen' };
+const feedStateLabel = (state, address) => (address?.startsWith('udp://') && UDP_FEED_STATES[state]) || FEED_STATES[state];
 
 const dom = {
   main: $('[data-admin]'),
@@ -148,6 +151,113 @@ function credentialsDialog({ title, intro, username, password }) {
   });
 }
 
+// A shell command to copy, e.g. a firewall rule. `label` names the Copy button.
+function commandBlock(label) {
+  const text = el('code', { class: 'command__text' });
+  const copy = el('button', { type: 'button', class: 'btn btn--sm', text: 'Copy', 'aria-label': label, on: { click: () => copyText(text.textContent, text) } });
+  return { root: el('div', { class: 'command' }, text, copy), set(command) { text.textContent = command; } };
+}
+
+// ---- scoreboard address -----------------------------------------------------------
+
+// How the server reads a Daktronics scoreboard (ARCHITECTURE.md §11): it
+// connects to the Lantronix box over TCP, or the box sends UDP datagrams to
+// the server. Stored as "10.20.1.50:10001" or "udp://10.20.1.50:21000".
+const SCOREBOARD_TRANSPORTS = [['tcp', 'Server connects to the box (TCP)'], ['udp', 'Box sends to this server (UDP)']];
+const DEFAULT_UDP_PORT = 21000;
+const ADDRESS_SCHEME = /^\s*(tcp|udp):\/\//i;
+const IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+
+// What a stored or typed address says: { udp, host, port }. The port is null
+// for TCP without one; an IPv6 address (TCP only) is left whole in `host`.
+function scoreboardTarget(address) {
+  const scheme = ADDRESS_SCHEME.exec(address);
+  const udp = scheme?.[1].toLowerCase() === 'udp';
+  const rest = address.slice(scheme?.[0].length ?? 0).trim();
+  const match = /^([^:]*):(\d{1,5})$/.exec(rest);
+  return { udp, host: match ? match[1] : rest, port: match ? Number(match[2]) : udp ? DEFAULT_UDP_PORT : null };
+}
+
+// The command that lets a box's datagrams through the server's firewall (ufw
+// drops them by default), worded as the server's test result words it; null
+// until `address` ("10.20.1.50" or "10.20.1.50:21000") is a valid one.
+function firewallCommand(address) {
+  const { host, port } = scoreboardTarget(`udp://${address.trim()}`);
+  return IPV4.test(host) && port >= 1024 && port <= 65535 ? `sudo ufw allow proto udp from ${host} to any port ${port}` : null;
+}
+
+// A scoreboard's address in a form: how the server reaches the box, and the
+// box's address. Over UDP that is the box's IP and the port it sends to on
+// this server, and the firewall command follows what is typed. A scheme
+// typed or pasted ("udp://…") picks the connection rather than being sent
+// twice.
+function scoreboardAddressFields({ label, tcpHint }) {
+  const name = uniqueId('connection');
+  const choices = Object.fromEntries(SCOREBOARD_TRANSPORTS.map(([value]) => [value, el('input', { type: 'radio', class: 'checkbox__input', name, value })]));
+  choices.tcp.checked = true;
+  const connection = el(
+    'fieldset',
+    { class: 'choice-group' },
+    el('legend', { class: 'field__label', text: 'Connection' }),
+    el('div', { class: 'choices choices--inline' }, SCOREBOARD_TRANSPORTS.map(([value, text]) => el('label', { class: 'checkbox' }, choices[value], el('span', { text })))),
+  );
+  const transport = {
+    get value() { return choices.udp.checked ? 'udp' : 'tcp'; },
+    set value(value) { choices[value].checked = true; },
+  };
+  const input = textInput({ class: 'input input--mono', maxLength: 60, autocapitalize: 'none' });
+  input.setAttribute('spellcheck', 'false');
+  const addressField = field(label, input, { hint: tcpHint });
+  const hint = addressField.querySelector('.field__hint');
+  const firewallText = el('p', { class: 'field__hint' });
+  const command = commandBlock('Copy the firewall command');
+  const firewall = el('div', { class: 'field' }, firewallText, command.root);
+  const sync = () => {
+    const udp = transport.value === 'udp';
+    input.placeholder = udp ? 'e.g. 10.20.1.50:21000' : 'e.g. 10.20.1.50 or 10.20.1.50:3001';
+    hint.textContent = udp ? 'The box’s IP address and the UDP port it sends to (Daktronics usually uses 21000, the port if you leave it out).' : tcpHint;
+    firewall.hidden = !udp;
+    const line = firewallCommand(input.value);
+    firewallText.textContent = line
+      ? 'This server’s firewall drops the box’s datagrams until you let them in. On the server, run:'
+      : 'Enter the box’s IP address to get the command that lets its datagrams through this server’s firewall.';
+    command.root.hidden = line === null;
+    command.set(line ?? '');
+  };
+  for (const choice of Object.values(choices)) choice.addEventListener('change', sync);
+  input.addEventListener('input', () => {
+    const scheme = ADDRESS_SCHEME.exec(input.value);
+    if (scheme) {
+      transport.value = scheme[1].toLowerCase();
+      input.value = input.value.slice(scheme[0].length);
+    }
+    sync();
+  });
+  sync();
+  return {
+    root: el('div', { class: 'address-fields' }, connection, addressField, firewall),
+    input,
+    // "udp://" and the address over UDP, the address as typed over TCP.
+    value() {
+      const text = input.value.trim();
+      if (text === '' || ADDRESS_SCHEME.test(text)) return text;
+      return transport.value === 'udp' ? `udp://${text}` : text;
+    },
+    // A stored address. An empty one keeps the connection chosen.
+    set(address) {
+      const scheme = ADDRESS_SCHEME.exec(address ?? '');
+      if (address) transport.value = scheme ? scheme[1].toLowerCase() : 'tcp';
+      input.value = address ? address.slice(scheme?.[0].length ?? 0) : '';
+      sync();
+    },
+    setDisabled(disabled) {
+      for (const choice of Object.values(choices)) choice.disabled = disabled;
+      input.disabled = disabled;
+      input.required = !disabled;
+    },
+  };
+}
+
 // ---- games ----------------------------------------------------------------------
 
 function teamFieldset(legend, team, { locked, autoCode }) {
@@ -252,9 +362,12 @@ function gameFormDialog(game = null) {
         return { input, text, root: el('label', { class: 'checkbox' }, input, text) };
       };
       const feedChoices = { default: feedChoice('default', 'Use the default scoreboard'), custom: feedChoice('custom', 'Another scoreboard'), off: feedChoice('off', 'Off') };
-      const feedAddress = textInput({ class: 'input input--mono', maxLength: 60, value: game?.scoreboard?.custom ?? '', placeholder: 'e.g. 10.20.1.51', autocapitalize: 'none' });
-      feedAddress.setAttribute('spellcheck', 'false');
-      const feedAddressField = field('IP address of its Lantronix box', feedAddress, { hint: 'Port 10001 unless you add another, e.g. 10.20.1.51:3001.', className: 'choices__more' });
+      const feedTarget = scoreboardAddressFields({
+        label: 'IP address of its Lantronix box',
+        tcpHint: 'Port 10001 unless the box was set up differently; not 30718 or 9999, which are the box’s setup ports.',
+      });
+      feedTarget.set(game?.scoreboard?.custom ?? '');
+      const feedAddressField = el('div', { class: 'choices__more' }, feedTarget.root);
       const feedHomeHint = el('p', { class: 'field__hint', text: `The scoreboard is only used when ${config.homeTeam.name} is the home team.` });
       const feedHint = el('p', { class: 'field__hint' });
       const feedSet = el(
@@ -269,7 +382,7 @@ function gameFormDialog(game = null) {
       (feedChoices[game?.scoreboard?.setting] ?? feedChoices.default).input.checked = true;
       const feedValue = () => {
         const choice = Object.values(feedChoices).find((c) => c.input.checked)?.input.value ?? 'default';
-        return choice === 'custom' ? feedAddress.value.trim() : choice;
+        return choice === 'custom' ? feedTarget.value() : choice;
       };
       const syncFeedDefault = () => {
         feedChoices.default.text.textContent = scoreboardSettings
@@ -284,8 +397,7 @@ function gameFormDialog(game = null) {
         feedHint.textContent = `While the game is live, its ${scoreboardFields(sports[sport.value], clockOn.checked)} come from the gym’s Daktronics scoreboard.`;
         const custom = feedChoices.custom.input.checked;
         feedAddressField.hidden = !custom;
-        feedAddress.disabled = feedSet.hidden || !custom;
-        feedAddress.required = !feedAddress.disabled;
+        feedTarget.setDisabled(feedSet.hidden || !custom);
         const team = home.value();
         const ours = config.homeTeam;
         const atHome = team.code === ours.code.toUpperCase() || team.name.toLowerCase() === ours.name.trim().toLowerCase();
@@ -301,7 +413,7 @@ function gameFormDialog(game = null) {
       feedChoices.off.input.addEventListener('change', syncFeed);
       feedChoices.custom.input.addEventListener('change', () => {
         syncFeed();
-        feedAddress.focus();
+        feedTarget.input.focus();
       });
 
       // Times are read in the school's time zone; say which, and say so
@@ -489,7 +601,7 @@ class GamesPanel {
     const mine = holder?.id === user.id;
     const team = (side) => el('span', { class: 'arow__team' }, teamChip(game[side]), el('span', { text: game[side].name }), started ? el('strong', { class: 'arow__score', text: String(game[side].score) }) : null);
     const feed = game.status === 'live' ? game.scoreboard : null;
-    const feedState = feed ? FEED_STATES[feed.state] : undefined;
+    const feedState = feed ? feedStateLabel(feed.state, feed.address) : undefined;
 
     const actions = [
       el('button', { type: 'button', class: 'btn btn--sm', text: 'Edit', on: { click: () => gameFormDialog(game) } }),
@@ -927,6 +1039,105 @@ function scoreboardReading(reading) {
   ]);
 }
 
+// "12 ms", "5 seconds", "3 minutes", "2 hours": how long a test (or a live
+// game's feed) has listened.
+function formatWait(ms) {
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  const [unit, size] = ms >= 7_200_000 ? ['hour', 3_600_000] : ms >= 120_000 ? ['minute', 60_000] : ['second', 1000];
+  const count = Math.round(ms / size);
+  return `${count} ${unit}${count === 1 ? '' : 's'}`;
+}
+
+const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
+
+// Whether what came in is scoreboard data. `from` names the sender (UDP).
+function dataChecks(result, ...from) {
+  if (result.receiving) return [checkItem(true, 'Scoreboard data is coming in', ...from, ` (${plural(result.frames, 'update')}).`)];
+  // A live game's feed that has gone quiet.
+  if (result.frames > 0) return [checkItem(false, 'No new data lately. Check that the scoreboard console is on.')];
+  if (result.bytes > 0) return [checkItem(false, 'Data came in', ...from, ', but it isn’t scoreboard data. Check the box’s serial settings.')];
+  return [];
+}
+
+// A TCP test: the server connects to the box. Refused, closed by the box
+// (another program has its one connection), silent, or reading.
+function tcpTestChecks(result) {
+  const where = el('span', { class: 'mono', text: result.address });
+  if (!result.connected) return { checks: [checkItem(false, 'Couldn’t connect to ', where, `: ${result.error ?? 'no answer'}.`)] };
+  if (result.closedByBox && result.bytes === 0) {
+    return { checks: [checkItem(
+      false,
+      'The box at ', where, ` accepted the connection, then closed it after ${formatWait(result.listenedMs)} without sending anything. `,
+      'A Lantronix box takes one connection at a time: another program (a Daktronics data monitor, the Lantronix Com Port Redirector, a video system) may be using it.',
+    )] };
+  }
+  const checks = [checkItem(true, 'Connected to ', where, '.')];
+  if (result.bytes === 0) {
+    checks.push(checkItem(
+      false,
+      `Nothing came in ${result.listenedMs >= 1000 ? `for ${formatWait(result.listenedMs)}` : 'yet'}. `,
+      'Check that this is the box’s data port (Channel 1 “Local Port”, 10001 unless it was changed) and that the scoreboard console is on. ',
+      `If the box sends over UDP, choose “${SCOREBOARD_TRANSPORTS[1][1]}” under Connection.`,
+    ));
+  } else checks.push(...dataChecks(result));
+  if (result.closedByBox) checks.push(checkItem(false, `Then the box closed the connection, after ${formatWait(result.listenedMs)}.`));
+  else if (result.error) checks.push(checkItem(false, `Then the connection failed: ${result.error}.`));
+  return { checks };
+}
+
+// A UDP test: the server listens on its port for the box's datagrams. The
+// port can't be used, the box's data arrives, another sender's does, or
+// nothing does - then what to check: the firewall, where the box sends, the
+// console.
+function udpTestChecks(result) {
+  const { host, port } = scoreboardTarget(result.address);
+  const box = el('span', { class: 'mono', text: host });
+  if (!result.connected) return { checks: [checkItem(false, `Couldn’t listen on UDP port ${port}: ${result.error ?? 'the port could not be opened'}.`)] };
+  const checks = [checkItem(true, `Listening on UDP port ${port}.`)];
+  let steps = null;
+  if (result.datagrams > 0) {
+    checks.push(...dataChecks(result, ' from ', box));
+  } else if (result.otherSources.length > 0) {
+    const senders = result.otherSources.flatMap((source, index, all) => [
+      index === 0 ? '' : index === all.length - 1 ? ' and ' : ', ',
+      el('span', { class: 'mono', text: source.address }),
+      ` (${plural(source.datagrams, 'datagram')})`,
+    ]);
+    const which = result.otherSources.length === 1 ? 'that’s' : 'one of them is';
+    checks.push(checkItem(false, `Data arrived on UDP port ${port} from `, ...senders, ', not from ', box, `. If ${which} the scoreboard, use its address.`));
+  } else {
+    checks.push(checkItem(false, 'Nothing arrived from ', box, ` on UDP port ${port} ${result.listenedMs >= 1000 ? `in ${formatWait(result.listenedMs)}` : 'yet'}.`));
+    steps = udpSteps(result, host, port);
+  }
+  if (result.error) checks.push(checkItem(false, `Then listening stopped: ${result.error}.`));
+  return { checks, steps };
+}
+
+// Nothing came over UDP: what to check, the firewall rule first (ufw drops
+// unsolicited datagrams, broadcasts included, without a trace).
+function udpSteps(result, host, port) {
+  const command = commandBlock('Copy the firewall command');
+  command.set(result.firewallHint ?? firewallCommand(`${host}:${port}`) ?? '');
+  // A box left on its address class's subnet mask broadcasts to a wider
+  // network (10.255.255.255) than a /24 server receives broadcasts for.
+  const first = Number(host.split('.')[0]);
+  const mask = first < 128 ? ['255.0.0.0', `${first}.255.255.255`] : first < 192 ? ['255.255.0.0', `${host.split('.').slice(0, 2).join('.')}.255.255`] : null;
+  return el(
+    'div',
+    { class: 'check-steps' },
+    el('p', { class: 'check-steps__title', text: 'Check that:' }),
+    el(
+      'ol',
+      { class: 'check-steps__list' },
+      el('li', {}, 'This server’s firewall lets the box’s datagrams in. On the server, run:', command.root),
+      el('li', {
+        text: `The box sends to this server’s IP address or to the network’s broadcast address, on UDP port ${port}.${mask ? ` A box whose subnet mask is left at ${mask[0]} broadcasts to ${mask[1]} instead, which this server may not receive.` : ''}`,
+      }),
+      el('li', { text: 'The scoreboard console is on.' }),
+    ),
+  );
+}
+
 // The Daktronics scoreboard feed (ARCHITECTURE.md §11): the default address
 // of the gym's Lantronix box, a connection test and the live feeds. Built
 // once and kept across the status refreshes, so typing isn't interrupted.
@@ -934,8 +1145,10 @@ class ScoreboardCard {
   constructor() {
     this.saved = null;
     this.badge = el('span', { class: 'badge' });
-    this.input = textInput({ class: 'input input--mono', maxLength: 60, placeholder: 'e.g. 10.20.1.50', autocapitalize: 'none' });
-    this.input.setAttribute('spellcheck', 'false');
+    this.address = scoreboardAddressFields({
+      label: 'Default scoreboard address',
+      tcpHint: 'The IP address of the scoreboard’s Lantronix box on the school network. Port 10001 unless the box was set up differently; not 30718 or 9999, which are the box’s setup ports.',
+    });
     this.saveButton = el('button', { type: 'submit', class: 'btn btn--primary', text: 'Save' });
     this.clearButton = el('button', { type: 'button', class: 'btn', text: 'Clear', disabled: true, on: { click: () => this.clear() } });
     this.testButton = el('button', { type: 'button', class: 'btn', text: 'Test connection', on: { click: () => this.test() } });
@@ -945,7 +1158,7 @@ class ScoreboardCard {
     const form = el(
       'form',
       { class: 'stack', novalidate: true },
-      field('Default scoreboard address', this.input, { hint: 'The IP address of the scoreboard’s Lantronix box on the school network. Port 10001 unless the box was set up differently (e.g. 10.20.1.50:3001).' }),
+      this.address.root,
       el('div', { class: 'card__actions' }, this.saveButton, this.clearButton, this.testButton),
       this.error,
     );
@@ -977,10 +1190,11 @@ class ScoreboardCard {
     }
   }
 
-  // An address being typed is kept, unless it was just saved.
+  // An address being typed (or a connection chosen) is kept, unless it was
+  // just saved.
   show(settings, { saved = false } = {}) {
     scoreboardSettings = settings;
-    if (saved || this.input.value.trim() === (this.saved ?? '')) this.input.value = settings.defaultAddress ?? '';
+    if (saved || this.address.value() === (this.saved ?? '')) this.address.set(settings.defaultAddress ?? '');
     this.saved = settings.defaultAddress;
     this.badge.className = `badge ${this.saved ? 'badge--ok' : 'badge--canceled'}`;
     this.badge.textContent = this.saved ? 'Set up' : 'Not set up';
@@ -1001,7 +1215,7 @@ class ScoreboardCard {
           { class: feed.state === 'unreachable' ? 'is-failed' : null },
           el('td', { class: 'mono', text: feed.address }),
           el('td', {}, el('a', { href: `/keeper?game=${encodeURIComponent(feed.gameId)}`, text: game ? matchup(game) : feed.gameId })),
-          el('td', { class: 'wrap' }, el('span', { class: 'table__main', text: capitalize(FEED_STATES[feed.state] ?? feed.state) }), feed.error ? el('span', { class: 'table__sub', text: feed.error }) : null),
+          el('td', { class: 'wrap' }, el('span', { class: 'table__main', text: capitalize(feedStateLabel(feed.state, feed.address) ?? feed.state) }), feed.error ? el('span', { class: 'table__sub', text: feed.error }) : null),
           el('td', { text: feed.lastReadingAt ? formatTimestamp(feed.lastReadingAt) : '—' }),
         );
       })),
@@ -1025,7 +1239,7 @@ class ScoreboardCard {
   }
 
   save() {
-    const address = this.input.value.trim();
+    const address = this.address.value();
     if (address === '') return this.clear();
     return this.patch(this.saveButton, address, 'Default scoreboard saved.');
   }
@@ -1045,14 +1259,17 @@ class ScoreboardCard {
 
   // Listens to the scoreboard for a few seconds (up to about 10).
   async test() {
-    const address = this.input.value.trim() || this.saved;
+    const address = this.address.value() || this.saved;
     if (!address) {
       this.testResults.replaceChildren(el('p', { class: 'notice notice--warn', text: 'Enter the scoreboard’s IP address first.' }));
-      this.input.focus();
+      this.address.input.focus();
       return;
     }
     setBusy(this.testButton, true);
-    this.testResults.replaceChildren(loadingState(`Listening to the scoreboard at ${address}… This takes up to 10 seconds.`));
+    const target = scoreboardTarget(address);
+    this.testResults.replaceChildren(loadingState(target.udp
+      ? `Listening on UDP port ${target.port} for the scoreboard at ${target.host}… This takes up to 10 seconds.`
+      : `Listening to the scoreboard at ${address}… This takes up to 10 seconds.`));
     try {
       const { result } = await api('/api/admin/scoreboard/test', { method: 'POST', body: { address }, timeoutMs: 30_000 });
       this.testResults.replaceChildren(this.testReport(result));
@@ -1069,24 +1286,15 @@ class ScoreboardCard {
   }
 
   testReport(result) {
-    const where = el('span', { class: 'mono', text: result.address });
-    const checks = [result.connected ? checkItem(true, 'Connected to ', where, '.') : checkItem(false, 'Couldn’t connect to ', where, `: ${result.error ?? 'no answer'}.`)];
-    if (result.connected && result.receiving) {
-      checks.push(checkItem(true, `Scoreboard data is coming in (${result.frames} ${result.frames === 1 ? 'update' : 'updates'}).`));
-    } else if (result.connected && result.frames > 0) {
-      // A live game's connection that has gone quiet.
-      checks.push(checkItem(false, 'No new data lately. Check that the scoreboard console is on.'));
-    } else if (result.connected && result.bytes > 0) {
-      checks.push(checkItem(false, 'Data came in, but it isn’t scoreboard data. Check the box’s serial settings.'));
-    } else if (result.connected) {
-      checks.push(checkItem(false, 'No data came in. Check that the scoreboard console is on and connected to the box.'));
-    }
+    const udp = result.transport === 'udp';
+    const { checks, steps = null } = udp ? udpTestChecks(result) : tcpTestChecks(result);
     const game = result.gameId ? store.get(result.gameId) : null;
     return el(
       'div',
       { class: 'stack' },
-      result.inUse ? el('p', { class: 'notice notice--info', text: `In use by a live game (${game ? matchup(game) : result.gameId}). This is what that game’s connection has read.` }) : null,
+      result.inUse ? el('p', { class: 'notice notice--info', text: `In use by a live game (${game ? matchup(game) : result.gameId}). This is what that game’s ${udp ? 'feed has received' : 'connection has read'}.` }) : null,
       el('ul', { class: 'check-list' }, checks),
+      steps,
       result.frames > 0 ? scoreboardReading(result.reading) : null,
     );
   }
