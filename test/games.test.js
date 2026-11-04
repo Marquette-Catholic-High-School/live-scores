@@ -4,7 +4,7 @@ import { act, createGame, gameInput, hexToken, startGame, startTestApp } from '.
 
 const HOUR = 60 * 60 * 1000;
 const GAME_KEYS = [
-  'id', 'sport', 'sportName', 'symbol', 'status', 'scheduledAt', 'location', 'home', 'away', 'period', 'periodLabel',
+  'id', 'sport', 'gender', 'level', 'sportName', 'symbol', 'status', 'scheduledAt', 'location', 'home', 'away', 'period', 'periodLabel',
   'periodShort', 'isOvertime', 'line', 'outs', 'note', 'clock', 'options', 'rules', 'scorekeeper', 'scoreboard', 'canStartAt',
   'startedAt', 'endedAt', 'updatedAt', 'version',
 ];
@@ -73,6 +73,49 @@ describe('games', () => {
     delete noAway.away;
     assert.equal((await admin.post('/api/games', noAway)).status, 400);
     assert.equal((await keeper.post('/api/games', gameInput())).status, 403);
+  });
+
+  it('labels a game with boys/girls and level, editable in any status', async () => {
+    const plain = await createGame(admin);
+    assert.deepEqual([plain.gender, plain.level, plain.sportName], [null, null, 'Basketball']);
+    const label = async (gender, level, sport = 'basketball') => {
+      const res = await admin.post('/api/games', gameInput({ sport, gender, level }));
+      assert.equal(res.status, 200, JSON.stringify({ gender, level }));
+      return res.json.game;
+    };
+    const girlsJv = await label('girls', 'jv');
+    assert.deepEqual([girlsJv.gender, girlsJv.level, girlsJv.sportName], ['girls', 'jv', 'Girls JV Basketball']);
+    assert.equal((await label('boys', 'varsity', 'volleyball')).sportName, 'Boys Varsity Volleyball');
+    assert.equal((await label('girls', null)).sportName, 'Girls Basketball');
+    assert.equal((await label(undefined, 'freshman')).sportName, 'Freshman Basketball');
+    assert.equal((await label(null, null)).sportName, 'Basketball');
+    // The public JSON carries the label too; the plain sport name stays in /api/sports.
+    assert.equal((await t.client().get(`/api/games/${girlsJv.id}`)).json.game.sportName, 'Girls JV Basketball');
+    assert.equal((await t.client().get('/api/sports')).json.sports.basketball.name, 'Basketball');
+
+    for (const [field, value] of [['gender', 'Girls'], ['gender', 'coed'], ['gender', ''], ['gender', 1], ['level', 'JV'], ['level', 'varsity '], ['level', true], ['level', 'sophomore']]) {
+      const bad = await admin.post('/api/games', gameInput({ [field]: value }));
+      assert.equal(bad.status, 400, `${field}: ${JSON.stringify(value)}`);
+      assert.equal(
+        bad.json.error.message,
+        field === 'gender' ? 'gender must be "boys", "girls" or null.' : 'level must be "varsity", "jv", "freshman" or null.',
+      );
+    }
+
+    // PATCH: omitted keeps the value, null clears it; allowed while live and after the end.
+    let res = await admin.patch(`/api/games/${girlsJv.id}`, { level: 'varsity' });
+    assert.deepEqual([res.json.game.gender, res.json.game.level, res.json.game.sportName], ['girls', 'varsity', 'Girls Varsity Basketball']);
+    assert.equal((await admin.patch(`/api/games/${girlsJv.id}`, { gender: 'Boys' })).status, 400);
+    await startGame(admin, girlsJv.id);
+    res = await admin.patch(`/api/games/${girlsJv.id}`, { gender: 'boys' });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.game.sportName, 'Boys Varsity Basketball');
+    await admin.post(`/api/games/${girlsJv.id}/end`, {});
+    res = await admin.patch(`/api/games/${girlsJv.id}`, { gender: null, level: null });
+    assert.equal(res.status, 200);
+    assert.deepEqual([res.json.game.gender, res.json.game.level, res.json.game.sportName], [null, null, 'Basketball']);
+    const stored = t.app.db.get('SELECT gender, level FROM games WHERE id = ?', girlsJv.id);
+    assert.deepEqual({ ...stored }, { gender: null, level: null });
   });
 
   it('hides the scorekeeper from anonymous viewers', async () => {

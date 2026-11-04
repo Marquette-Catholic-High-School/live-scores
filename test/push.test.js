@@ -112,6 +112,28 @@ describe('push flows (fake APNs)', () => {
     assert.equal(pushLog(t, game.id, 'channel').filter((row) => row.sent === 1).length, 2);
   });
 
+  it("starts Live Activities with the game's label (boys/girls and level) as sportName", async () => {
+    const token = await register(t, 'label-device');
+    const { game } = await startedGame({ sport: 'volleyball', gender: 'girls', level: 'jv' });
+    assert.equal(game.sportName, 'Girls JV Volleyball');
+    const start = t.transport.byKind('device').find((c) => c.path.endsWith(token) && c.json.aps.attributes.gameId === game.id);
+    assert.ok(start, 'push-to-start sent');
+    const { aps } = start.json;
+    assert.deepEqual(Object.keys(aps.attributes).sort(), ATTRIBUTE_KEYS);
+    assert.equal(aps.attributes.sport, 'volleyball');
+    assert.equal(aps.attributes.sportName, 'Girls JV Volleyball');
+    assert.deepEqual(aps.alert, { title: 'MAR vs LIN is live', body: 'Girls JV Volleyball · Follow the score on your Lock Screen' });
+    // Attributes are fixed once an activity runs: an edit reaches the game JSON
+    // (and activities started later), while updates carry only the content state.
+    const before = t.transport.byKind('broadcast').length;
+    const edited = await admin.patch(`/api/games/${game.id}`, { gender: 'boys', level: 'varsity' });
+    assert.equal(edited.json.game.sportName, 'Boys Varsity Volleyball');
+    await act(admin, game.id, { type: 'score', team: 'home', points: 1 });
+    await waitFor(() => t.transport.byKind('broadcast').length > before, { message: 'update broadcast' });
+    for (const call of t.transport.byKind('broadcast').slice(before)) assert.equal(call.json.aps.attributes, undefined);
+    await admin.post(`/api/games/${game.id}/end`, {});
+  });
+
   it('marks invalid tokens and records failures', async () => {
     const gone = await register(t, 'invalid-gone');
     const bad = await register(t, 'invalid-bad');

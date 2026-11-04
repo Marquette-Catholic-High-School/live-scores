@@ -10,8 +10,7 @@
 
 import { performance } from 'node:perf_hooks';
 import { CHANNEL_GONE_REASONS, INVALID_TOKEN_REASONS, SETUP_ERROR_REASONS, describeFailure, setupHint } from './apns.js';
-import { activityAttributes, activityChange, activityContentState } from './games.js';
-import { getSport } from './sports.js';
+import { activityAttributes, activityChange, activityContentState, gameLabel } from './games.js';
 
 const ENVIRONMENTS = ['production', 'sandbox'];
 const START_CONCURRENCY = 100;
@@ -317,7 +316,6 @@ export class PushService {
   }
 
   #startPayload(game, channelId, environment) {
-    const sport = getSport(game.sport);
     return {
       aps: {
         timestamp: this.#nextTimestamp(game.id, environment),
@@ -329,7 +327,7 @@ export class PushService {
         'stale-date': this.#staleDate(game),
         alert: {
           title: `${game.home.code} vs ${game.away.code} is live`,
-          body: `${sport.name} · Follow the score on your Lock Screen`,
+          body: `${gameLabel(game)} · Follow the score on your Lock Screen`,
         },
       },
     };

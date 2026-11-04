@@ -6,6 +6,10 @@ import { FIELDS, encodeField, encodeFrame } from '../server/rtd.js';
 import { parseScoreboardAddress } from '../server/scoreboard.js';
 import { createGame, sleep, startGame, startTestApp, waitFor } from './helpers.js';
 
+// Games these tests start by hand are scheduled an hour ahead: a game whose
+// time has come starts by itself once its scoreboard sends data.
+const AHEAD = 3_600_000;
+
 const FAST = {
   connectTimeoutMs: 500,
   retryDelaysMs: [50, 100],
@@ -234,8 +238,8 @@ describe('Daktronics scoreboard addresses', () => {
     assert.equal(game.scoreboard.setting, 'custom');
     assert.equal(game.scoreboard.custom, 'udp://10.20.1.51:21001');
     assert.equal(game.scoreboard.address, 'udp://10.20.1.51:21001');
-    assert.match(game.scoreboard.message, /udp:\/\/10\.20\.1\.51:21001 once the game starts/);
-    res = await admin.post('/api/games', { sport: 'basketball', away: { name: 'Lincoln', code: 'LIN', color: '#B22234' }, scheduledAt: Date.now(), scoreboard: '10.20.1.51:30718' });
+    assert.match(game.scoreboard.message, /^Starts automatically at \d{1,2}:\d\d [AP]M once the scoreboard at udp:\/\/10\.20\.1\.51:21001 is on\.$/);
+    res = await admin.post('/api/games', { sport: 'basketball', away: { name: 'Lincoln', code: 'LIN', color: '#B22234' }, scheduledAt: Date.now() + AHEAD, scoreboard: '10.20.1.51:30718' });
     assert.equal(res.status, 400);
     assert.match(res.json.error.message, /setup port/);
     res = await admin.patch(`/api/games/${game.id}`, { scoreboard: 'TCP://10.20.1.51' });
@@ -278,7 +282,7 @@ describe('Daktronics scoreboard over UDP', () => {
     const port = await freeUdpPort();
     const set = await admin.patch('/api/admin/scoreboard', { defaultAddress: `UDP://127.0.0.1:${port}` });
     assert.equal(set.json.defaultAddress, `udp://127.0.0.1:${port}`);
-    const game = await createGame(admin, { scheduledAt: Date.now() });
+    const game = await createGame(admin, { scheduledAt: Date.now() + AHEAD });
     assert.equal(udp.sockets.length, 0, 'nothing listens before the game starts');
     const started = await startGame(admin, game.id);
     assert.equal(started.game.scoreboard.state, 'connecting');
@@ -350,7 +354,7 @@ describe('Daktronics scoreboard over UDP', () => {
     const holder = await bindUdp(port);
     assert.ok(holder);
     const before = udp.sockets.length;
-    const game = await createGame(admin, { scheduledAt: Date.now(), scoreboard: `udp://127.0.0.1:${port}` });
+    const game = await createGame(admin, { scheduledAt: Date.now() + AHEAD, scoreboard: `udp://127.0.0.1:${port}` });
     await startGame(admin, game.id);
     const live = await waitForGame(admin, game.id, (g) => g.scoreboard.state === 'unreachable', 'unreachable');
     assert.equal(live.scoreboard.message, `Can't listen for the scoreboard on UDP port ${port}: another program on this server is using that UDP port. Retrying.`);
@@ -392,8 +396,8 @@ describe('Daktronics scoreboard over UDP', () => {
     try {
       other.app.scoreboard.start();
       const boss = await other.signedIn('boss', 'admin');
-      const one = await createGame(boss, { scheduledAt: Date.now(), scoreboard: `udp://127.0.0.1:${listening}` });
-      const two = await createGame(boss, { scheduledAt: Date.now(), scoreboard: `udp://127.0.0.1:${blocked}`, sport: 'volleyball' });
+      const one = await createGame(boss, { scheduledAt: Date.now() + AHEAD, scoreboard: `udp://127.0.0.1:${listening}` });
+      const two = await createGame(boss, { scheduledAt: Date.now() + AHEAD, scoreboard: `udp://127.0.0.1:${blocked}`, sport: 'volleyball' });
       await startGame(boss, one.id);
       await startGame(boss, two.id);
       await waitForGame(boss, one.id, (g) => g.scoreboard.state === 'waiting', 'listening');
@@ -432,7 +436,7 @@ describe('Daktronics scoreboard over UDP: sources and sharing', () => {
 
   it("keeps only the box's datagrams; a test for another box shares the socket and lists who else sent", async () => {
     await admin.patch('/api/admin/scoreboard', { defaultAddress: 'udp://10.20.1.50' });
-    const game = await createGame(admin, { scheduledAt: Date.now() });
+    const game = await createGame(admin, { scheduledAt: Date.now() + AHEAD });
     await startGame(admin, game.id);
     await waitForGame(admin, game.id, (g) => g.scoreboard.state === 'waiting', 'listening');
     assert.equal(fake.open(21000).length, 1);
@@ -528,8 +532,8 @@ describe('Daktronics scoreboard over UDP: sources and sharing', () => {
   });
 
   it('two boxes on one port share a socket until both games end', async () => {
-    const one = await createGame(admin, { scheduledAt: Date.now(), scoreboard: 'udp://10.20.1.61:23000' });
-    const two = await createGame(admin, { scheduledAt: Date.now(), scoreboard: 'udp://10.20.1.62:23000', sport: 'volleyball' });
+    const one = await createGame(admin, { scheduledAt: Date.now() + AHEAD, scoreboard: 'udp://10.20.1.61:23000' });
+    const two = await createGame(admin, { scheduledAt: Date.now() + AHEAD, scoreboard: 'udp://10.20.1.62:23000', sport: 'volleyball' });
     await startGame(admin, one.id);
     await startGame(admin, two.id);
     await waitForGame(admin, two.id, (g) => g.scoreboard.state === 'waiting', 'second feed listening');
@@ -547,7 +551,7 @@ describe('Daktronics scoreboard over UDP: sources and sharing', () => {
 
   it("reports a port the server isn't allowed to use, then listens once it can", async () => {
     fake.failNext('EACCES');
-    const game = await createGame(admin, { scheduledAt: Date.now(), scoreboard: 'udp://10.20.1.60:21500' });
+    const game = await createGame(admin, { scheduledAt: Date.now() + AHEAD, scoreboard: 'udp://10.20.1.60:21500' });
     await startGame(admin, game.id);
     const live = await waitForGame(admin, game.id, (g) => g.scoreboard.state === 'unreachable', 'unreachable');
     assert.equal(live.scoreboard.message, "Can't listen for the scoreboard on UDP port 21500: the server isn't allowed to use that port. Retrying.");
@@ -572,7 +576,7 @@ describe('Daktronics scoreboard over UDP: sources and sharing', () => {
   });
 
   it('stop() closes the sockets of feeds and running tests', async () => {
-    const game = await createGame(admin, { scheduledAt: Date.now(), scoreboard: 'udp://10.20.1.70:24000' });
+    const game = await createGame(admin, { scheduledAt: Date.now() + AHEAD, scoreboard: 'udp://10.20.1.70:24000' });
     await startGame(admin, game.id);
     await waitForGame(admin, game.id, (g) => g.scoreboard.state === 'waiting', 'listening');
     const test = t.app.scoreboard.test('udp://10.20.1.71:24001');

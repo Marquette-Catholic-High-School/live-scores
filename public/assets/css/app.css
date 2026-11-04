@@ -191,6 +191,7 @@ hr { border: 0; border-top: 1px solid var(--border); margin: var(--space-1) 0; }
 
 .stack { display: grid; gap: var(--space-4); }
 .stack--lg { gap: var(--space-5); }
+.stack--sm { gap: var(--space-2); }
 
 .noscript {
   margin: var(--space-4);
@@ -508,10 +509,14 @@ hr { border: 0; border-top: 1px solid var(--border); margin: var(--space-1) 0; }
 }
 
 .form-grid--team { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto; }
+/* Sport, then boys / girls and the level. */
+.form-grid--sport { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr); }
 
 @media (max-width: 520px) {
-  .form-grid--team { grid-template-columns: 1fr 1fr; }
-  .form-grid--team .field--wide { grid-column: 1 / -1; }
+  .form-grid--team,
+  .form-grid--sport { grid-template-columns: 1fr 1fr; }
+  .form-grid--team .field--wide,
+  .form-grid--sport .field--wide { grid-column: 1 / -1; }
 }
 
 .fieldset {
@@ -829,15 +834,16 @@ hr { border: 0; border-top: 1px solid var(--border); margin: var(--space-1) 0; }
   min-height: 24px;
 }
 
+/* A long label ("Girls Varsity Basketball") wraps rather than losing the sport. */
 .game-card__sport {
-  overflow: hidden;
+  min-width: 0;
   color: var(--text-muted);
   font-size: 0.75rem;
   font-weight: 750;
   letter-spacing: 0.07em;
-  text-overflow: ellipsis;
+  line-height: 1.3;
   text-transform: uppercase;
-  white-space: nowrap;
+  text-wrap: balance;
 }
 
 .game-card__state {
@@ -1375,15 +1381,16 @@ hr { border: 0; border-top: 1px solid var(--border); margin: var(--space-1) 0; }
 
 .console__back { padding-inline: 8px; }
 
+/* The game's label, on two lines on a phone ("Girls Freshman / Volleyball"). */
 .console__title {
-  overflow: hidden;
+  min-width: 0;
   font-size: 0.875rem;
   font-weight: 750;
   letter-spacing: 0.07em;
+  line-height: 1.25;
   text-align: center;
-  text-overflow: ellipsis;
   text-transform: uppercase;
-  white-space: nowrap;
+  text-wrap: balance;
 }
 
 .console__sync { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; }

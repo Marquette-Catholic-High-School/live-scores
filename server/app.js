@@ -62,11 +62,14 @@ export function createApp({
     const game = games.getGame(gameId);
     if (game) sse.publishGame(game.id, (authenticated) => games.serialize(game, { authenticated }));
   });
-  // What decides which game a scoreboard drives (§11). When it changes, the
-  // feed is re-decided before the change is published, so the published game
-  // (and the next action's 409 check) already reflects it.
+  // What decides which game a scoreboard drives, and which scheduled games it
+  // is watched for (§11). When it changes, the feed is re-decided before the
+  // change is published, so the published game (and the next action's 409
+  // check) already reflects it.
   const feedKey = (game) =>
-    game ? JSON.stringify([game.status, game.scoreboard, game.scoreboardManual, game.sport, game.home.name, game.home.code, game.startedAt]) : null;
+    game
+      ? JSON.stringify([game.status, game.scoreboard, game.scoreboardManual, game.sport, game.home.name, game.home.code, game.startedAt, game.scheduledAt])
+      : null;
 
   games.setHooks({
     changed: (before, after) => {

@@ -3,8 +3,10 @@
 Live scores for the Marquette Catholic High School app, hosted on the school's own
 server. Scorekeepers enter scores in a web portal (or in the iOS app); the server
 shows them instantly on the public scoreboard and in the app, and puts a **Live
-Activity** on the Lock Screen and Dynamic Island of every iPhone that has "Sports
-Updates" turned on. It runs on one small Linux VM with no Firebase and no other
+Activity** on the Lock Screen and Dynamic Island of every iPhone with the app (unless its
+owner turned **Live Activities** off in the app). Home basketball and volleyball games
+can run on their own from the gym's scoreboard: they start at their time once the
+scoreboard is on, and end at the final horn. It runs on one small Linux VM with no Firebase and no other
 cloud services: one Node.js process, an SQLite database file, and Caddy for HTTPS
 (or, if you prefer no open ports, a [Cloudflare Tunnel](#53-cloudflare-tunnel-instead-of-open-ports)).
 Apple's push service (APNs) does the heavy lifting of delivering updates to phones.
@@ -60,7 +62,7 @@ plain containers) and less than 1 GB free on `/`, and warns below 1 GB RAM, belo
 be in use by another web server (apache2, nginx).
 
 **Why so small:** score updates go to Apple as *broadcast* pushes: one request per
-update per environment, and Apple fans it out to every phone. Only "Start game"
+update per environment, and Apple fans it out to every phone. Only a game's start
 sends one push per registered phone, over a single HTTP/2 connection. The live
 scoreboard uses one lightweight connection per open browser tab or app screen.
 The database is a few megabytes. Disk space is mostly the OS, logs and 14 days of
@@ -506,27 +508,39 @@ elsewhere without a code change with the launch argument
 
 ## 8. How game day works
 
-1. **Schedule** (admin): add the game in the portal: sport, teams, time, location.
+1. **Schedule** (admin): add the game in the portal: sport, **Boys / Girls** and
+   **level** (Varsity, JV, Freshman), teams, time, location. The two make the game's
+   label - "Girls JV Basketball", "Boys Varsity Volleyball" - which the portal, the app
+   and the Live Activity show as the game's title, so fans can tell the girls' game from
+   the boys' game. Leave either one blank: "Girls Basketball", "Freshman Basketball", or
+   just "Basketball". You can change the label any time, even during or after the game;
+   Live Activities already on Lock Screens keep the label they started with.
 2. **Claim** (scorekeeper): sign in on the portal or in the app (Scores → scorekeeper
-   button) and claim the game, so only you can score it.
-3. **Start** (from 2 hours before the scheduled time; admins any time): tap
-   **Start game**. Within seconds a Live Activity appears on every iPhone with the
-   MCHS app, **Sports Updates** turned on and Live Activities allowed.
+   button) and claim the game, so only you can score it. (A game the scoreboard starts
+   by itself is unclaimed: any scorekeeper can claim it.)
+3. **Start**: a home basketball or volleyball game read from the gym scoreboard (8.1)
+   **starts by itself at its scheduled time, once the scoreboard is on**. Any other game:
+   tap **Start game** (from 2 hours before the scheduled time; admins any time). Within
+   seconds a Live Activity appears on every iPhone with the MCHS app and Live Activities
+   on - they are on by default; people who don't want them turn **Live Activities** off
+   in the app's notification settings (and iOS must allow Live Activities for the app).
 4. **Score**: every tap (points, period, clock, outs, notes, undo) updates the
    portal scoreboard and the app instantly; Lock Screens update within a few seconds
    (updates are combined to at most one every 5 s per game to stay within Apple's
    push budget).
    The game clock runs on the phones by itself.
-5. **End game**: the final score is pushed and the Live Activity disappears two hours
-   later. Live games nobody has changed for 4 hours are ended automatically.
+5. **End**: a game the scoreboard drives **ends by itself 2 minutes after the final
+   horn**; otherwise tap **End game**. The final score is pushed and the Live Activity
+   disappears two hours later. Live games nobody has changed for 4 hours are ended
+   automatically.
 
 Anyone can also follow a game from its detail screen in the app with **Show on Lock
-Screen**, even if they had Sports Updates off.
+Screen**, even with Live Activities turned off in the app.
 
 ### 8.1 Scores from the Daktronics scoreboard (optional)
 
 The server can read the gym scoreboard and keep the score, game clock and period up to
-date by itself. It works with a **Daktronics All Sport 5000** console whose data output
+date by itself, and start and end those games by itself (see "On game day" below). It works with a **Daktronics All Sport 5000** console whose data output
 goes to a **Lantronix** serial-to-Ethernet box (the box Daktronics uses for video
 systems), for **basketball and volleyball** games where **Marquette is the home team**.
 Volleyball reads the points in the current set, the set number and each finished set's
@@ -554,7 +568,8 @@ sends anything to the box.
      port: the box's IP address and the UDP port it sends to. IPv4 only, port 1024 or
      higher.
 6. New games use this default scoreboard. In a game's form you can pick **another
-   scoreboard** (e.g. a second gym) or turn it **off** for that game.
+   scoreboard** (e.g. a second gym) or turn it **off** for that game (it then neither
+   reads the scoreboard nor starts or ends by itself).
 
 Ports 30718, 30704, 9999, 14000-14009 and 80 belong to the box itself (setup, GPIO,
 Telnet setup, Com Port Redirector, its web page) and never carry scoreboard data, so the
@@ -631,23 +646,76 @@ datagrams reach can read them.
 
 **On game day**
 
-* A person still claims and starts the game; once it is live the server connects to
-  the scoreboard (or, over UDP, starts listening for it). The scorekeeper console (portal
-  and app) shows the scoreboard status, and the score, clock, period and undo buttons are
-  locked: the scoreboard wins. Notes (Timeout, Halftime, ...) and **End game** stay with
-  the scorekeeper.
-* Right after connecting, the score appears as soon as it changes on the scoreboard or
-  the operator stops the clock (the console only sends what changes).
+* **Games start by themselves.** From a game's scheduled time the server watches its
+  scoreboard (connects to the box, or listens for it over UDP); as soon as the console is
+  on and sending, the game goes live, within about a second, and every iPhone gets its
+  Live Activity, exactly as if someone had tapped **Start game**. Example: a game set for
+  5:00 PM starts at 5:00 if the scoreboard is already on, or at 5:07 when the operator
+  turns it on at 5:07. Nobody needs to claim it first; any scorekeeper can claim it
+  afterwards for notes and **End game**. A scorekeeper (or admin) can still start a game
+  by hand earlier, as before.
+* It starts only within **3 hours** of its scheduled time, and never while another live
+  game uses the same scoreboard - whether the scoreboard drives that game, someone scores
+  it by hand, or its scoreboard was set to **Off** during the game: it starts once that
+  game has ended. If two games on one scoreboard are both due, the later-scheduled one
+  starts and the earlier one is skipped for good; the console then says "Won't start by
+  itself" for it (start it by hand if it is played, or cancel it).
+* **To keep a game from starting by itself** (for example a JV game played without the
+  scoreboard, or the console on for practice at that time): in the game's form set the
+  scoreboard to **Off**, or tap **Score by hand** in the scorekeeper console before the
+  start. **Cancel or reschedule** a game that isn't played: otherwise it starts if the
+  scoreboard is on within 3 hours of its time.
+* The scorekeeper console shows what will happen, e.g. "Starts automatically at 5:00 PM
+  once the scoreboard at 10.20.1.50:10001 is on." or, once its time has come, why it
+  hasn't started yet.
+* Once a game is live the scorekeeper console (portal and app) shows the scoreboard
+  status, and the score, clock, period and undo buttons are locked: the scoreboard wins.
+  Notes (Timeout, Halftime, ...) and **End game** stay with the scorekeeper.
+* Right after the start (or connecting), the clock appears within a second; the score and
+  period appear as soon as they change on the scoreboard or the operator stops the clock
+  (the console only sends what changes). If the console still shows **the game before**
+  (its final score, not reset yet), the new game takes only the clock: it stays at 0-0 in
+  the first period, and the scorekeeper console says "The scoreboard still shows the game
+  before ...". A **warm-up clock** shows as the game clock until the operator sets the game
+  clock, and a 0:00 left over from the game before shows until the console is reset; a
+  warm-up clock running out never ends the new game. Once the operator resets the console
+  (new game: scores 0, period 1, in one step or several), the game takes the score and
+  period from it. **Reset the console for the next game** soon after a game ends. If the
+  console really shows this game (for example the game was started late), tap **Score by
+  hand**, then **Use the scoreboard**: it then takes what the console shows.
+* **Games end by themselves at the final horn**: basketball once the 4th quarter (or an
+  overtime) runs out with the clock at 0:00 and the score not tied, volleyball once a
+  team has won the match (every set, the third too, to 25 by 2, as IHSA plays it). The
+  scorekeeper console shows "Final horn: the game ends by itself by 7:43 PM, 2 minutes
+  after the last score change. Time put back on the clock keeps it going."; two minutes
+  after the horn the game ends with that score. Free throws after the horn start the 2
+  minutes again; time put back on the clock, a tie (overtime) or another period cancels
+  it. If the operator starts resetting the console for the next game during those 2
+  minutes (the period moved back, or a score set to 0), the game ends right away with its
+  final score. Moving a won volleyball match on to the next game number adds no set. A
+  game scored by hand (or without a game clock) never ends by itself: tap **End game**. A
+  warm-up clock started within 2 minutes of the horn also counts as the game going on:
+  end that game by hand. A volleyball match whose deciding set is played to 15 (not IHSA)
+  is also ended by hand.
+* So on a double-header night, a girls' game at 5:00 that ends at the horn frees the
+  scoreboard, and the boys' game at 6:30 starts by itself once the console is on at 6:30
+  (or right after the girls' game ends, if that is later: at 0-0 until the console is
+  reset for it). A correction to the girls' final made on the console after the girls'
+  game ended goes into neither game: an admin corrects the final in the portal.
 * If the scoreboard is wrong or can't be reached, tap **Score by hand**: the feed pauses
   for that game and the buttons work again. **Use the scoreboard** switches back; the
   scoreboard's numbers then replace the hand-entered ones.
 * If two live games point at the same scoreboard (a JV game nobody ended, then
   varsity), the game started last gets the readings; the other one switches to scoring
   by hand and stays that way, even after the newer game ends.
-* If the operator resets the scoreboard for the next game before this one was ended,
-  the server doesn't copy the reset: after 30 seconds the game switches to scoring by
-  hand with its final score intact, ready to be ended.
-* When the game ends, the server disconnects from the box (over UDP, it stops listening).
+* If the operator resets the scoreboard for the next game before this one was ended (and
+  it didn't end at the horn), the server doesn't copy the reset: after 30 seconds the game
+  switches to scoring by hand with its final score intact, ready to be ended. It then no
+  longer holds the scoreboard, so the next game can start by itself.
+* When the game ends, the server disconnects from the box (over UDP, it stops listening),
+  unless another game on that scoreboard is due to start: then it keeps watching for it.
+  While it watches with the console off, it renews the TCP connection every 90 seconds;
+  that is no error, and the console keeps saying it is waiting for data.
 
 ## 9. Verify APNs
 
@@ -703,9 +771,9 @@ Things to know:
   with their defaults, e.g. `SCHOOL_TIMEZONE` (`America/Chicago`, or what you enter at
   the prompt / pass with `--school-timezone`) and the capacity keys. Its output line
   `Updated /etc/mchs-live/mchs-live.env: …` lists what changed.
-* The server updates the database schema by itself when it starts (now version 3:
+* The server updates the database schema by itself when it starts (now version 4:
   version 2 added the tables that let pushes survive a restart, version 3 the scoreboard
-  settings of section 8.1). An older server refuses a database
+  settings of section 8.1, version 4 a game's Boys/Girls and level). An older server refuses a database
   a newer one has updated ("schema version … is newer than this server"): to go back to
   an older version, re-run its installer (it stops because the server doesn't start),
   then `sudo mchs-live-restore` the `-pre-upgrade` backup taken before the upgrade
@@ -871,7 +939,8 @@ adds an `import` line and leaves them alone. Add other sites as separate
 
 Work through these in order:
 
-1. **Sports Updates** is on in the app's notification settings.
+1. **Live Activities** is on in the app's notification settings (it is by default;
+   **Sports Updates** there only controls sports notifications).
 2. **Live Activities are allowed** for the app: iOS Settings → MCHS → Live Activities.
 3. The phone **opened the app at least once since installing or updating it**: that
    is when the app registers its push-to-start token with the server. Open the app
@@ -888,7 +957,7 @@ Work through these in order:
 Updates arrive a few seconds late on purpose (at most one update every 5 s per game;
 longer if Apple throttles). iOS may delay or drop updates for phones in Low Power
 Mode or with "More Frequent Updates" switched off; the next update catches up. A phone that
-was offline during "Start game" gets no Live Activity for that game, but can add it
+was offline when the game started gets no Live Activity for that game, but can add it
 with **Show on Lock Screen** in the app.
 
 ### No HTTPS / certificate errors
@@ -961,6 +1030,28 @@ connection** gives more detail:
   it catches up at the next score or when the operator stops the clock.
 * If the console's **RTD OFFSET** setting isn't 0, positions are shifted; the server
   allows for 5000/10000/15000, but 0 is safest.
+
+### A game didn't start or end by itself
+
+The scorekeeper console's "Scoreboard" panel says why. A game starts by itself only if it is
+basketball or volleyball with Marquette at home, its scoreboard isn't **Off**, it isn't set to
+**Score by hand**, its scheduled time has come (and was less than 3 hours ago), the scoreboard
+is on and sending (see the previous section if it says it's waiting for data), and no other
+live game uses that scoreboard - including one scored by hand someone forgot to end, or one
+whose scoreboard was set to **Off** during the game: end that game, or start this one by
+hand. Of two games due on one scoreboard, only the later-scheduled one starts. An admin can
+always start a game by hand.
+
+A game that started while the console still showed the game before stays at 0-0 until the
+console is reset for it ("The scoreboard still shows the game before"): reset the console
+(new game), or, if it does show this game, tap **Score by hand**, then **Use the scoreboard**.
+
+A game ends by itself only while the scoreboard drives it: not when it is scored by hand,
+has no game clock, or the score is tied. The basketball clock has to run out (0:00) in the
+4th quarter or overtime and then stay there, with no score change, for 2 minutes; time put
+back on the clock or a warm-up clock started in those 2 minutes cancels it. A volleyball
+match ends 2 minutes after the winning point (every set to 25 by 2). Otherwise tap
+**End game** (forgotten games end after 4 hours without changes).
 
 ### The server doesn't start
 

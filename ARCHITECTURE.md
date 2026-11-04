@@ -9,24 +9,28 @@ them drift.
 
 ## 1. What it does
 
-1. An **admin** schedules games (sport, teams, time, location) in the web portal.
+1. An **admin** schedules games (sport, boys/girls and level, teams, time, location)
+   in the web portal.
 2. A **scorekeeper** signs in (web portal or the iOS app), claims a game, and at
-   game time taps **Start game**.
-3. The server immediately **starts a Live Activity on every iPhone that has
-   "Sports Updates" turned on** (APNs push-to-start), each one subscribed to an
-   APNs **broadcast channel** for that game.
+   game time taps **Start game**. A home basketball or volleyball game on the gym's
+   scoreboard (§11) starts by itself at its time, as soon as the scoreboard is on.
+3. The server immediately **starts a Live Activity on every iPhone with the app**
+   (APNs push-to-start; opt-out: the app's "Live Activities" setting, on by default),
+   each one subscribed to an APNs **broadcast channel** for that game.
 4. Every score / period / clock change the scorekeeper makes is sent as **one
    broadcast push** to that channel, so every Lock Screen and Dynamic Island
    updates within a second or two, no matter how many fans there are.
 5. The web portal's public scoreboard and the app's Scores screen update live via
    **Server-Sent Events**.
 6. **End game** pushes the final score and the Live Activity dismisses itself
-   two hours later. Live games nobody has changed for `AUTO_FINAL_HOURS` are ended automatically.
+   two hours later. A game the scoreboard drives ends by itself two minutes after the
+   final horn (§11). Live games nobody has changed for `AUTO_FINAL_HOURS` are ended automatically.
 
 Firebase is **not** used by any part of this system. The rest of the iOS app
 (accounts, photographer scheduler, Photo Drop, FCM announcements) stays on
-Firebase and is untouched; the only touch point is the existing "Sports Updates"
-toggle, which now also opts the device in/out of game Live Activities.
+Firebase and is untouched; the only touch point is the notification settings screen,
+where the app's own "Live Activities" switch (on by default, separate from the "Sports
+Updates" notifications) opts the device out of game Live Activities.
 
 ## 2. Components
 
@@ -158,7 +162,9 @@ games(
   created_by INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
   version INTEGER NOT NULL DEFAULT 1, -- +1 on every state change
   scoreboard TEXT NOT NULL DEFAULT 'default',   -- schema 3, §11: 'default' | 'off' | '<ip>:<port>' | 'udp://<ipv4>:<port>'
-  scoreboard_manual INTEGER NOT NULL DEFAULT 0  -- schema 3, §11: 1 = the scorekeeper scores this game by hand
+  scoreboard_manual INTEGER NOT NULL DEFAULT 0, -- schema 3, §11: 1 = the scorekeeper scores this game by hand
+  gender TEXT,                       -- schema 4, §6: 'boys' | 'girls' | NULL (not set)
+  level TEXT                         -- schema 4, §6: 'varsity' | 'jv' | 'freshman' | NULL (not set)
 )
 game_events(
   id INTEGER PRIMARY KEY,
@@ -173,7 +179,7 @@ devices(
   id INTEGER PRIMARY KEY,
   token TEXT NOT NULL UNIQUE,        -- push-to-start token, lowercase hex
   environment TEXT NOT NULL CHECK (environment IN ('production','sandbox')),
-  enabled INTEGER NOT NULL DEFAULT 1,-- "Sports Updates" on
+  enabled INTEGER NOT NULL DEFAULT 1,-- the app's "Live Activities" setting on (opt-out)
   activities_enabled INTEGER NOT NULL DEFAULT 1, -- ActivityAuthorizationInfo().areActivitiesEnabled
   app_version TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
@@ -205,9 +211,9 @@ channel_cleanup(                     -- PRIMARY KEY (environment, channel_id)
 settings(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)  -- 'scoreboard.defaultAddress'
 ```
 
-The schema version is `PRAGMA user_version` (currently **3**). Migrations run at startup,
+The schema version is `PRAGMA user_version` (currently **4**). Migrations run at startup,
 each in one transaction; migration 2 also queues the channels of games that had already
-ended for deletion. A database with a newer version than the server knows is refused
+ended for deletion; migration 4 adds `gender` and `level` (NULL for existing games). A database with a newer version than the server knows is refused
 (an older server can't open a database a newer one has migrated).
 
 Keep only the last 30 days of `push_log`; delete sessions after expiry; devices
@@ -304,7 +310,9 @@ length, **stopped**. A period with 0 minutes has no clock (`clock_ms = NULL`).
 {
   "id": "k3j9x2m4pq",
   "sport": "basketball",
-  "sportName": "Basketball",
+  "gender": "girls",                      // boys | girls | null (not set)
+  "level": "jv",                          // varsity | jv | freshman | null (not set)
+  "sportName": "Girls JV Basketball",     // the game's display label (below)
   "symbol": "basketball.fill",
   "status": "live",                       // scheduled | live | final | canceled
   "scheduledAt": 1793570400000,
@@ -332,6 +340,14 @@ length, **stopped**. A period with 0 minutes has no clock (`clock_ms = NULL`).
   "channels": { "production": "dHN0LXNyY2gtY2hubA==", "sandbox": "…" }   // only while live; ids may be null if creation failed
 }
 ```
+
+`sportName` is the game's full display label, `[Boys|Girls] [Varsity|JV|Freshman] <sport
+name>`: "Girls JV Basketball", "Boys Varsity Volleyball", "Girls Basketball" (no level),
+"Freshman Basketball" (no gender), "Basketball" (neither). Every client shows it as the
+game's title (so builds from before the label show it with no change; it can be about 30
+characters, so titles must fit or wrap); the plain sport name stays in `GET /api/sports`.
+The server builds it with `gameLabel(game)` (`server/games.js`), for the JSON, the Live
+Activity attributes (§8.5) and the push-to-start alert.
 
 `home.setScore` / `away.setScore` = current set points for `scoreMode: 'sets'`, else `null`.
 Clients compute the running clock as
@@ -400,6 +416,7 @@ Codes used: `bad_request` 400, `unauthorized` 401, `forbidden` 403, `not_found` 
 * `POST /api/games/:id/start` → `{ game, push: { queued: <devices> } }`
   * Must be `scheduled`. Scorekeepers must hold the claim (an unclaimed game is auto-claimed) and `now ≥ canStartAt`, else 409 `too_early`. Admins may start any time.
   * Sets `status=live`, `startedAt=now`, `period=0`, `line=[{home:0,away:0}]`, `outs=0`, `note=''`, clock reset (stopped), then triggers the start push flow (§8) **asynchronously** (the HTTP response does not wait for APNs).
+  * The scoreboard feed starts eligible games by itself the same way, with no user (§11 "Starting by itself"); a start request for a game already started → 409.
 * `POST /api/games/:id/actions` `{ actionId, type, ... }` → `{ game, duplicate?: true }`
   * Caller must hold the claim (or be admin). Game must be `live` (except `set_score` by an admin on a `final` game — "correct final score": SSE `game` event, no push).
   * `actionId` (required, 8–64 printable ASCII chars): idempotency key. If an event with the same `(game_id, action_id)` exists, nothing is applied and the current game is returned with `duplicate: true`. Clients generate a UUID per user intent and reuse it on retries.
@@ -422,13 +439,14 @@ Codes used: `bad_request` 400, `unauthorized` 401, `forbidden` 403, `not_found` 
   * While the scoreboard drives the game (§11, `scoreboard.controlling`), `score`, `set_score`, `period`, `clock` and `undo` → 409 `scoreboard_active`. Notes stay manual.
   * Every applied action: `version+1`, `updated_at=now`, insert `game_events`, emit SSE `game`, schedule an APNs update when the Lock Screen content changed (§8.2).
 * `POST /api/games/:id/end` → `{ game }` — holder or admin; `live` → `final` (409 otherwise), clock stopped, `note` cleared, `endedAt=now`, end push flow (§8).
-* `POST /api/games/:id/scoreboard` `{ manual: boolean }` → `{ game }` — holder or admin, `scheduled` or `live`: score this game by hand (the scoreboard feed pauses for it) or let the scoreboard drive it again (§11).
+* `POST /api/games/:id/scoreboard` `{ manual: boolean }` → `{ game }` — holder or admin, `scheduled` or `live`: score this game by hand (the scoreboard feed pauses for it; before the start it also keeps the game from starting by itself, and live it keeps it from ending at the final horn) or let the scoreboard drive it again (§11).
 
 ### Admin (role `admin`)
-* `POST /api/games` `{ sport, home:{name,code,color}, away:{name,code,color}, location, scheduledAt, options:{ clockEnabled?, periodMinutes?, overtimeMinutes?, bestOf? }, scoreboard? }` → `{ game }`
+* `POST /api/games` `{ sport, gender?, level?, home:{name,code,color}, away:{name,code,color}, location, scheduledAt, options:{ clockEnabled?, periodMinutes?, overtimeMinutes?, bestOf? }, scoreboard? }` → `{ game }`
+  * `gender`: `"boys"`, `"girls"` or `null`; `level`: `"varsity"`, `"jv"`, `"freshman"` or `null` (exact lowercase values; omitted or `null` = not set; anything else → 400 `gender must be "boys", "girls" or null.` / `level must be "varsity", "jv", "freshman" or null.`). They make the game's label (§6).
   * `scoreboard` (§11): `"default"` (the default), `"off"`, or the address of another scoreboard box (§11 "Addresses"): over TCP `"10.20.1.51"`, `"10.20.1.51:3001"` or `"tcp://10.20.1.51"` (IPv4/IPv6 literals only; port 10001 if omitted; the Lantronix box's own ports → 400), over UDP `"udp://10.20.1.51"` or `"udp://10.20.1.51:21001"` (IPv4 only; port 21000 if omitted, 1024–65535). Stored and returned in canonical form; 400 otherwise.
   * Validation: sport known; `home` optional (default: the `HOME_TEAM_*` team), `away` required; names 1–40 chars; codes 2–4 chars `[A-Z0-9]` (uppercased); colors `#RRGGBB`; `location` ≤ 100 chars; scheduledAt a number of ms (2000–2100); `periodMinutes` 1–60; `overtimeMinutes` 0–30; `bestOf` 3|5. Options that don't apply to the sport are validated but ignored. Missing options take the sport defaults.
-* `PATCH /api/games/:id` same fields, all optional → `{ game }`. Sport and team names/codes/colors are locked once the game has **started** (also after it ended: Live Activities carry them) → 409. Changing the sport resets the options to its defaults. For a live game, options that would leave the current period beyond the last one allowed → 409; the clock is brought in line with the new options.
+* `PATCH /api/games/:id` same fields, all optional (`null` clears `gender` / `level`) → `{ game }`. `gender` and `level` can be changed in any status; Live Activities already showing keep the label they started with (attributes are fixed, §8.5), new ones get the new label. Sport and team names/codes/colors are locked once the game has **started** (also after it ended: Live Activities carry them) → 409. Changing the sport resets the options to its defaults. For a live game, options that would leave the current period beyond the last one allowed → 409; the clock is brought in line with the new options.
 * `DELETE /api/games/:id` → `{ ok: true }` — not allowed while `live` (409; end or cancel it first, so its Live Activities get the end broadcast). Its channels are queued for deletion (§8.3).
 * `POST /api/games/:id/cancel` → `{ game }` — `scheduled|live` → `canceled` (409 otherwise), clock stopped, `endedAt=now`; if it was live, run the end push flow with note `Canceled`.
 * `GET /api/users` → `{ users: [user + { disabled, createdAt }] }`
@@ -437,12 +455,13 @@ Codes used: `bad_request` 400, `unauthorized` 401, `forbidden` 403, `not_found` 
 * `DELETE /api/users/:id` → `{ ok: true }`
 * `GET /api/admin/status` → `{ apns: { configured, environments, teamId, keyId, bundleId, error? }, devices: { production: { enabled, total, invalid }, sandbox: {…} }, recentPushes: [push_log rows, newest 50], sseClients }` (`error` only while APNs isn't configured)
 * `POST /api/admin/apns-check` → `{ results: { <env>: { ok, channelId?, error? } } }` — creates a test broadcast channel in each environment, reads it back, then deletes it. Verifies the key, team, bundle and broadcast capability end to end.
-* `GET /api/admin/scoreboard` → `{ defaultAddress: "<ip>:<port>" | "udp://<ipv4>:<port>" | null, feeds: [{ address, gameId, state, error, lastReadingAt }] }` (§11)
+* `GET /api/admin/scoreboard` → `{ defaultAddress: "<ip>:<port>" | "udp://<ipv4>:<port>" | null, feeds: [{ address, gameId, watching, state, error, lastReadingAt }] }` (§11) — one feed per scoreboard a live game reads (`watching: false`), and one per scoreboard watched for a scheduled game to start (`watching: true`, `gameId` = that game)
 * `PATCH /api/admin/scoreboard` `{ defaultAddress: "[tcp://]<ip>[:port]" | "udp://<ipv4>[:port]" | null | "" }` → same (400 on an invalid address, with the reason; `null`/`""` clears it)
 * `POST /api/admin/scoreboard/test` `{ address }` (same forms) → `{ result }` — listens to that scoreboard for a few seconds (up to ~10 s) and reports what arrived (§11 "Test connection"):
-  `{ address, transport: "tcp" | "udp", inUse, gameId?, connected, receiving, error, bytes, frames, badFrames, reading: { clockMs, clockRunning, home, away, period, sportCode, games? }, listenedMs }`,
+  `{ address, transport: "tcp" | "udp", inUse, gameId?, watching?, connected, receiving, error, bytes, frames, badFrames, reading: { clockMs, clockRunning, home, away, period, sportCode, games? }, listenedMs }`,
   plus `closedByBox` over TCP and `datagrams`, `otherSources: [{ address, datagrams }]`, `firewallHint` over UDP.
-  If a live game is already reading that address, describes that feed instead (`inUse: true`, `gameId`): the box accepts one
+  If a feed already reads that address, describes that feed instead (`inUse: true`, `gameId`, `watching`: false for a live
+  game's feed, true for one watching for a scheduled game to start, whose id is then `gameId`): the box accepts one
   TCP connection at a time; over UDP the test shares the port's socket with any feed on it.
 
 ### 7.1 Server-Sent Events — `GET /api/stream`
@@ -484,15 +503,16 @@ data: {"serverTime":…,"id":"k3j9x2m4pq"}
 APNs specifics (hosts, ports, headers, payload keys) are in §8.4 and are the
 verified values the server must use.
 
-### 8.1 Start (scorekeeper taps **Start game**)
+### 8.1 Start (scorekeeper taps **Start game**, or the scoreboard starts the game, §11)
 1. For each environment in `APNS_ENVIRONMENTS`: create a broadcast channel for the game
    if `channel_<env>` is NULL (message storage policy `APNS_CHANNEL_STORAGE_POLICY`,
    default **0**) and store its id.
 2. For every device with `enabled=1 AND activities_enabled=1 AND invalid_at IS NULL` in
-   that environment (Sports Updates on **and** Live Activities allowed), send a
-   **push-to-start** with `input-push-channel` = that environment's channel id,
+   that environment (the app's Live Activities setting on **and** Live Activities allowed in
+   iOS), send a **push-to-start** with `input-push-channel` = that environment's channel id,
    the `GameActivityAttributes`, the initial content state, `stale-date` (§8.2) and an alert
-   (`title`: "MAR vs LIN is live", `body`: "Basketball · Follow the score on your Lock Screen").
+   (`title`: "MAR vs LIN is live", `body`: "<label> · Follow the score on your Lock Screen",
+   e.g. "Girls JV Basketball · Follow the score on your Lock Screen"; label per §6).
    * Fan-out over a single HTTP/2 session per environment, ≤ 100 requests in flight.
    * The fan-out covers the devices registered when the game started, in device-id order,
      and its progress is persisted (`push_progress`): devices are claimed in blocks of 100
@@ -529,7 +549,7 @@ verified values the server must use.
 * The clock ticks on the device by itself (`clockEndsAt`), so a running clock costs no
   pushes — only start/stop/set do.
 
-### 8.3 End (End game, cancel, or auto-final)
+### 8.3 End (End game, cancel, auto-final, or the final horn §11)
 * Broadcast `event: "end"` with the final content state (note cleared on end; `Canceled`
   for a canceled game) and `dismissal-date` = now + 2 h. The end broadcast is persisted
   (`pending_ends`) before it is sent and retried — also after a restart — until it is
@@ -597,10 +617,15 @@ verified values the server must use.
 
 `attributes` (fixed for the life of the activity):
 ```json
-{ "gameId": "k3j9x2m4pq", "sport": "basketball", "sportName": "Basketball", "symbol": "basketball.fill",
+{ "gameId": "k3j9x2m4pq", "sport": "basketball", "sportName": "Girls JV Basketball", "symbol": "basketball.fill",
   "homeName": "Marquette", "homeCode": "MAR", "homeColor": "#12214D",
   "awayName": "Lincoln",   "awayCode": "LIN", "awayColor": "#B22234" }
 ```
+`sportName` is the game's label (§6), up to about 30 characters ("Girls Varsity Basketball",
+"Boys Freshman Volleyball"); the widget must fit it. Attributes never change once an
+activity runs: editing a live game's gender or level updates the game JSON and the
+activities started after the edit (a push-to-start fan-out still running picks it up for
+the devices it hasn't reached), not the ones already on Lock Screens.
 
 `content-state`:
 ```jsonc
@@ -636,8 +661,9 @@ verified values the server must use.
   can be overridden with the `LiveScoresServerURL` user default / launch argument
   `-LiveScoresServerURL http://localhost:8080`.
 * **Device registration** — on launch and whenever the push-to-start token,
-  the Sports Updates toggle or `areActivitiesEnabled` changes, the app `POST`s
-  `/api/devices`. Environment: `sandbox` for DEBUG builds, `production` otherwise.
+  the app's **Live Activities** setting (on by default, a missing setting means on; it
+  alone sets `enabled`, while "Sports Updates" controls only the sports notifications) or
+  `areActivitiesEnabled` changes, the app `POST`s `/api/devices`. Environment: `sandbox` for DEBUG builds, `production` otherwise.
   Observation of `pushToStartTokenUpdates` and `activityUpdates` starts in
   `didFinishLaunching` (push-to-start relaunches the app in the background), and the
   static `pushToStartToken` is re-read a few seconds later (Apple's workaround for a
@@ -726,8 +752,9 @@ last** wins (an earlier game someone forgot to end must not take the new game's 
 others show `standby` and are switched to scoring by hand for good (`scoreboard_mode` event
 without a user, reason "a newer game took the scoreboard"), so they don't get the box - and the
 newer game's scores - back when it ends; only a scorekeeper's **Use the scoreboard** does that.
-If the winner is scored by hand, nobody gets the feed. A person still starts and ends every
-game.
+If the winner is scored by hand, nobody gets the feed. Such a game also starts by itself at
+its time once the scoreboard is on, and ends by itself at the final horn (below); a person
+can still start and end any game.
 
 **What is read.** Only the score, the main clock and the period:
 
@@ -763,21 +790,140 @@ mode reaches every total the console shows (a decrease comes off the current per
 earlier ones, then later ones left by a period stepped back). Frames arriving together are
 applied together (150 ms debounce, 500 ms at most).
 
-Guards against the console moving on before the app does:
+Guards against the console moving on before the app does, or not yet:
 * **Console reset**: the console back at period/game 1 with lower scores (volleyball: game 1
   at 0-0) while the game is further on means it was set up for the next game before this one
   was ended. Nothing of it is applied; after 30 s the game is switched to scoring by hand
   (reason "the scoreboard was reset for another game") with its score intact, for the
   scorekeeper to end. If the scorekeeper then chooses **Use the scoreboard**, the check is
   off for that game.
+* **The game before**: right after a start (by a person or by the scoreboard) the console may
+  still show the game before - its final, not reset yet, sent in full each time a warm-up
+  clock stops. While a game is at its start (first period, 0-0), a reading that shows the
+  game before lends it only the clock: its period and score are not applied, and
+  `scoreboard.message` is "The scoreboard still shows the game before: this game's score and
+  period are read once the console is reset for it. Only the clock is read until then."
+  ("points and set" for volleyball, no clock sentence without a clock). A reading shows the
+  game before when its period is at or beyond the last period of the latest game of that
+  sport that ended (final, or canceled while live) on this scoreboard before this game
+  started and got past its first period, or either team's score is at or beyond that game's
+  (non-zero) score there (volleyball: the points in the set the console was on). For a game
+  the scoreboard started (nobody saw the console then) any period after the first also
+  counts, whatever the game before was. The check is over once the console has shown 0-0 in
+  the first period, or the game has taken a score (it left 0-0): a reset in steps (the period
+  first, then the scores, or the other way) is taken once it is complete, and as the game is
+  still in its first period the reset is never mistaken for a reset for another game. **Use
+  the scoreboard** (after **Score by hand**) turns the check off: what it shows is what the
+  scorekeeper wants. What the check goes by comes from the database (the start event,
+  `scoreboard_mode` events, ended games), so it works the same after a restart.
 * **Volleyball clear**: points cleared to 0-0 in the same game take the console's record of
   that game when it has one; otherwise they are held for 20 s (for good on the match's last
-  set), so a finished set keeps its score when the operator clears the board before moving on.
+  set, and while a won match waits for its final-horn hold), so a finished set keeps its
+  score when the operator clears the board before moving on.
 * **Volleyball beyond the match**: a game number past the match's last set is ignored, and so
-  are its points.
+  are its points; so is the console moving on to the next game number once the match is won
+  (the finished sets, or the current set once won, decide it), so a won best-of-3 never ends
+  3-0.
+
+**Starting by itself.** A scheduled game starts by itself when all of these hold:
+* it is eligible (basketball or volleyball, the school's team at home), its `scoreboard`
+  resolves to an address, and it isn't set to be scored by hand (`scoreboardManual`);
+* its time has come: `scheduledAt` ≤ now < `scheduledAt` + 3 h (`AUTO_START_WINDOW_MS`);
+* no live game holds that scoreboard: neither one it drives nor one a **person** switched to
+  scoring by hand (the gym is in use either way), nor one whose scoreboard was set to **Off**
+  after the scoreboard read it (it holds the default scoreboard). A game the feed itself
+  handed over to scoring by hand - the console was reset for another game, or a newer game
+  took the scoreboard - holds nothing;
+* it is the game to start there: of several due games on one scoreboard, the one with the
+  latest `scheduledAt` (tie: the lower id). A game is passed over for good once a game
+  scheduled no earlier on that scoreboard has started since its time came, so it never
+  starts after that game ends;
+* the scoreboard is on: a valid RTD data frame arrived within the last 5 s.
+
+While a scoreboard has such a due game and no live game holds it, the server opens its feed
+(TCP connection, or UDP port) only to watch: nothing is applied to any game until it starts.
+The feed is closed again as soon as no game qualifies (its window passed; the game was
+edited, canceled or deleted, set to **Off** or **Score by hand**). The check runs on every
+5 s tick and whenever frames arrive (after the 150-500 ms debounce), so a game starts within
+about a second of the console sending data, or within 5 s of its time when the console is
+already on. It is re-checked inside the start's transaction against the database, then the
+game starts exactly like **Start game** (status `live`, `startedAt`, `changed` and `started`
+hooks: SSE, push-to-start fan-out to every registered device, broadcast channels) with no
+user: `scorekeeper` stays null (any scorekeeper can claim it), the `start` event has no
+`user_id` and data `{ "auto": true, "reason": "scoreboard" }`, and the log says "game started
+by the scoreboard". The feed then drives the game as usual: the scoreboard wins. A watch
+that opens a new connection starts from an empty block, so right after the start typically
+only the clock is known; the score and period follow when they change or the clock stops. A
+live game's feed that turns into a watch as the game ends keeps its block. Either way, what
+still shows the game before (its final, the console not reset yet) is held back by the
+guard above: the new game takes only the clock (a warm-up clock running shows as the game
+clock until the operator sets it; a 0:00 left from the game before until the console is
+reset), so a doubleheader's second game never starts with the first game's score, a warm-up
+clock running out at the old "4th quarter" is no final horn, and the operator's **New game**
+is applied, not held as a reset for another game. A change the table makes to the first
+game's final on the console after that game ended (a correction, late free throws more than
+2 minutes after the horn) goes into neither game: an admin corrects the final. To keep a game
+from starting by itself: set its scoreboard to **Off**, or **Score by hand** before the start
+(both exist already; there is no other switch).
+
+The scorekeeper's `scoreboard.message` for a scheduled game (`state` stays `idle` for every
+game that hasn't started; clients rely on it):
+* before its time: "Starts automatically at 5:00 PM once the scoreboard at 10.20.1.50:10001
+  is on." (time in `SCHOOL_TIMEZONE`);
+* due and watched: "Starts automatically once the scoreboard is on. " + the feed's status
+  ("Connected to 10.20.1.50:10001, waiting for data from the scoreboard console."), then
+  "The scoreboard is on: starting…";
+* due while another live game holds the scoreboard: "Starts automatically once Girls JV
+  Basketball (Marquette vs Lincoln) has ended: that game is still live on this scoreboard.";
+* due, but another due game starts first: "Not started automatically: Boys Varsity
+  Basketball (Marquette vs Lincoln), scheduled later on this scoreboard, starts instead.";
+* passed over: "Won't start by itself: Boys Varsity Basketball (Marquette vs Lincoln) started
+  on this scoreboard after this game's time. Start it by hand if it is played, or cancel it.";
+* more than 3 h past its time: "Won't start by itself any more: its time was more than 3
+  hours ago. Start it by hand if it is played, or cancel it."
+
+**Final horn.** While the scoreboard drives a game (`controlling`), the game ends by itself
+2 minutes (`FINAL_HORN_HOLD_MS`) after it is over on the scoreboard, judged on the game's
+state after each reading:
+* basketball (points mode, game clock on): the 4th quarter or any overtime, the clock stopped
+  at 0:00, the totals not tied - and the clock has run in that period (from the event log,
+  so it holds across a restart): 0:00 right after the console moved on to the 4th quarter is
+  a clock not set yet, not the horn;
+* volleyball: a team has won the match, `ceil(bestOf / 2)` sets: the finished sets as §5
+  counts them (`i < period`, higher points), plus the current set once it is won (25 points
+  by 2, the deciding set too, as IHSA plays it; `SET_POINTS` in `server/games.js`) - counted
+  only if points were scored in it after the set began, so the last set's points still
+  showing when the console moves on to the next game are not a win. A deciding set played to
+  15 (NFHS outside Illinois) never counts as won: such a match is ended by hand.
+
+When the conditions first hold, a hold starts. Any score change during it (free throws after
+the horn) starts it again; the game going on cancels it (time put back on the clock, the
+clock set for overtime, another period, a tie). When it completes, the game ends through
+`GameService.end` with no user (`auto: true`; event data `{ "auto": true, "reason": "final
+horn" }`; re-checked inside the transaction: still driven by the scoreboard, still over),
+then the end broadcast as usual (§8.3), and the scoreboard is free for the next game. If the
+console is set up for the next game while the hold runs - in any order: the period (game
+number) moved back, or a team's score cleared to 0 (volleyball: points cleared to 0-0 are
+held instead, as above) - the game ends at once with the score it had: the reading is never
+applied and the game is never handed over to scoring by hand. During the hold
+`scoreboard.message` gives the end, rounded up to the minute, in `SCHOOL_TIMEZONE`, and isn't
+republished as time passes (only when the hold starts again): "Final horn: the game ends by
+itself by 7:43 PM, 2 minutes after the last score change. Time put back on the clock keeps it
+going." (volleyball "Match won: the game ends by itself by 7:43 PM, 2 minutes after the last
+point.").
+Games scored by hand never end this way, nor games without a game clock (or an overtime
+without one); `AUTO_FINAL_HOURS` still ends forgotten games. Holds live in memory and their
+timers are cleared when the game ends, is scored by hand, loses the feed, or the service
+stops; a hold that is over ends the game on the next tick even if the console went quiet;
+after a restart the next reading starts a new hold.
+
+So on a game night, a girls' game at 5:00 ending at the horn frees the scoreboard, and the
+boys' game scheduled at 6:30 starts by itself once the console is on at 6:30 (at once, if the
+girls' game ends after 6:30 with the console on: at 0-0, its score and period read once the
+console is reset for it).
 
 **Screens.** Admin console → System: the default address, **Test connection** (what the
-box sends right now) and the live feeds; the game form: Use the default / Another scoreboard
+box sends right now) and the open feeds (live games', and watches for games due to start); the game form: Use the default / Another scoreboard
 / Off (basketball and volleyball only). Scorekeeper console (portal and iOS app): a
 "Scoreboard" panel with `scoreboard.message`, warning style for `unreachable` / `waiting`,
 and **Score by hand** / **Use the scoreboard** (before the start too). Queued actions the
@@ -793,21 +939,27 @@ scoring is deliberate.
 
 **Status updates.** A change of feed status (connected, unreachable, ...) gets a new game
 `version` (not `updated_at`) and an SSE event, like any change. Whenever a change affects which
-game a box drives (status, `scoreboard`, the manual switch, sport, home team, start), the
-feed is re-decided before the change is published, so the response, the SSE event and the
+game a box drives or is watched for (status, `scoreboard`, the manual switch, sport, home
+team, start, scheduled time), the feed is re-decided before the change is published, so the response, the SSE event and the
 next action's 409 check agree. Changing the default address republishes every scheduled or
-live game on the default.
+live game on the default. A scheduled game's status is republished when its time comes or
+its window passes (on the tick), and when the game holding its scoreboard, or the game to
+start first there, changes.
 
-**TCP connections.** Opened only while a game needs the feed, closed after; never written to
+**TCP connections.** Opened only while a game needs the feed (or a game due to start is
+watched for), closed after; never written to
 (the Lantronix would pass the bytes into the console). TCP keepalive; reconnect after 2, 5,
 10, 20 then every 30 s (the backoff resets only once the box sends valid frames); reconnect
-after 90 s without data; `waiting` after 15 s without data. The reader drops garbage in linear
+after 90 s without data; `waiting` after 15 s without data. A feed watching for a game to
+start renews its connection after 90 s without data instead - the console is just off - at
+once, without an error, `unreachable` or backoff, and without publishing a status change
+(only a renewal that fails is reported, like any failed connection). The reader drops garbage in linear
 time. A reconnect, or another game taking over the box, starts from an empty block. The box
 accepts **one TCP connection at a time**: if another system (e.g. a Daktronics video system)
 holds it, the server is refused (`unreachable`, "connection refused: the box isn't accepting
 connections on this port. It may use another port, send over UDP instead, or already be
 connected to another system (it accepts one connection at a time)").
-`POST /api/admin/scoreboard/test` reuses the live connection when there is one.
+`POST /api/admin/scoreboard/test` reuses the feed's connection (a live game's, or a watch) when there is one.
 
 **UDP feeds.** One socket per port, bound without an address (on Linux a socket bound to an
 address never receives subnet broadcasts), shared by every feed and test on that port: each
@@ -848,7 +1000,8 @@ and returns `{ result }`:
   `[{ address, datagrams }]`, most datagrams first (a box sending from another address shows
   up here); `firewallHint` — `"sudo ufw allow proto udp from 10.20.1.50 to any port 21000"`.
 
-If a live game's feed already uses that exact address, the result describes that feed
-(`inUse: true`; over UDP `otherSources` is then empty). A UDP test on a port a feed for a
+If a feed already uses that exact address, the result describes that feed (`inUse: true`,
+`gameId`, and `watching`: true when the feed only watches for a scheduled game to start,
+`gameId` then being that game; over UDP `otherSources` is then empty). A UDP test on a port a feed for a
 **different** box already has bound shares that socket: it never binds twice and never
 disturbs the feed.

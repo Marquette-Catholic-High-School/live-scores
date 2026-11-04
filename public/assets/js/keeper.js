@@ -9,7 +9,7 @@ import { clockRemainingMs, formatClock, onTick, serverNow, splitClock } from './
 import { ActionQueue } from './queue.js';
 import {
   SIDES, finalLabel, hasStarted, isHalfInnings, isSetsMode, lineScoreTable, matchup, maxPeriodIndex, outsIndicator, periodInfoAt,
-  scoreLine, scoreboardFields, statusBadge, teamChip, updateTeamChip,
+  scoreLine, scoreboardFields, startsByItself, statusBadge, teamChip, updateTeamChip,
 } from './render.js';
 import { connectStream } from './sse.js';
 import { GameStore, coalesce } from './store.js';
@@ -20,6 +20,10 @@ import {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MAX_CLOCK_MS = 3_600_000;
+// A scheduled game on a scoreboard starts by itself once the scoreboard is
+// on, from its start time until this much later (server/scoreboard.js
+// AUTO_START_WINDOW_MS).
+const AUTO_START_WINDOW_MS = 3 * 60 * 60 * 1000;
 
 const dom = {
   main: $('[data-keeper]'),
@@ -692,11 +696,12 @@ class ConsoleView {
     // Pre-game
     ui.start = el('button', { type: 'button', class: 'btn btn--go btn--xl btn--block', text: 'Start game', on: { click: () => this.start() } });
     ui.startHint = el('p', { class: 'control__hint control__hint--center' });
+    ui.startLead = el('p', { class: 'control__lead' });
     ui.pregame = el(
       'section',
       { class: 'control control--pregame' },
       el('h2', { class: 'control__title', text: 'Before the game' }),
-      el('p', { class: 'control__lead', text: 'Tap Start game when play begins. The game goes live on the scoreboard and on the Lock Screen of every iPhone with Sports Updates turned on.' }),
+      ui.startLead,
       ui.start,
       ui.startHint,
     );
@@ -971,6 +976,12 @@ class ConsoleView {
     } else if (admin && now < game.canStartAt) hint = `Scheduled for ${formatDayTime(game.scheduledAt)}. As an admin you can start it early.`;
     else hint = `Scheduled for ${formatDayTime(game.scheduledAt)}.`;
     if (ui.startHint.textContent !== hint) ui.startHint.textContent = hint;
+    // A game the scoreboard starts by itself (§11) needs no tap.
+    const how = startsByItself(game.scoreboard)
+      ? 'The scoreboard starts this game by itself once it’s on and the start time has come. Tap Start game only to start it yourself.'
+      : 'Tap Start game when play begins.';
+    const lead = `${how} The game goes live on the web, in the MCHS app and on the Lock Screen of every iPhone with Live Activities on.`;
+    if (ui.startLead.textContent !== lead) ui.startLead.textContent = lead;
     if (!ui.start.hasAttribute('aria-busy')) ui.start.disabled = Boolean(otherHolder && !admin) || locked;
   }
 
@@ -1234,17 +1245,39 @@ class ConsoleView {
       return;
     }
     const fields = scoreboardFields(game.rules, game.options.clockEnabled);
+    // The scoreboard also starts a scheduled game, and ends a live one at the
+    // final horn or once the match is won (a game without a clock is ended
+    // by hand), but not while it is scored by hand (§11).
+    const sets = isSetsMode(game);
+    const endsByItself = sets || Boolean(game.rules.clock?.available && game.options.clockEnabled);
+    const activities = config.apnsEnabled
+      ? 'Every iPhone with the MCHS app then gets a Live Activity on its Lock Screen showing this game’s score, unless Live Activities are turned off in the app.'
+      : null;
+    const now = serverNow();
     let ok = true;
     if (manual) {
+      let also = null;
+      if (!live && startsByItself(game.scoreboard)) also = 'It also won’t start by itself: tap Start game when play begins.';
+      else if (live && endsByItself) also = `It also won’t end by itself ${sets ? 'once the match is won' : 'at the final horn'}: tap End game.`;
       ok = await confirmDialog({
         title: 'Score this game by hand?',
-        body: [`The scoreboard won’t update this game’s ${fields} until you switch back with “Use the scoreboard”.`],
+        body: [`The scoreboard won’t update this game’s ${fields} until you switch back with “Use the scoreboard”.`, also],
         confirmLabel: 'Score by hand',
       });
     } else if (live) {
       ok = await confirmDialog({
         title: 'Use the scoreboard?',
         body: [`The ${fields} follow the scoreboard again. What you entered by hand is replaced by what the scoreboard shows.`],
+        confirmLabel: 'Use the scoreboard',
+      });
+    } else if (now < game.scheduledAt + AUTO_START_WINDOW_MS) {
+      // Back on the scoreboard, a scheduled game starts by itself: right
+      // away once its time has come and the scoreboard is already on.
+      ok = await confirmDialog({
+        title: 'Use the scoreboard?',
+        body: now < game.scheduledAt
+          ? [`This game then starts by itself once the scoreboard is on and its start time has come (${formatDayTime(game.scheduledAt)}).`, activities]
+          : ['This game then starts by itself as soon as the scoreboard is on, right away if it’s on now. The start can’t be undone.', activities],
         confirmLabel: 'Use the scoreboard',
       });
     }
@@ -1281,7 +1314,7 @@ class ConsoleView {
     const game = this.game;
     const ui = this.ui;
     const body = [
-      'The game goes live right away. Every iPhone with Sports Updates turned on in the MCHS app gets a Live Activity on its Lock Screen showing this game’s score.',
+      'The game goes live right away. Every iPhone with the MCHS app gets a Live Activity on its Lock Screen showing this game’s score, unless Live Activities are turned off in the app.',
       'Start only when play is about to begin. This can’t be undone.',
     ];
     if (!config.apnsEnabled) body.push('Live Activities aren’t set up on this server yet, so only the scoreboard and the app’s Scores screen will show the game.');
@@ -1297,7 +1330,7 @@ class ConsoleView {
       if (config.apnsEnabled) {
         message += queued > 0
           ? ` Starting the Live Activity on ${queued} ${queued === 1 ? 'iPhone' : 'iPhones'}.`
-          : ' No iPhones have Sports Updates turned on yet.';
+          : ' No iPhones have Live Activities turned on yet.';
       }
       toast(message, { tone: 'success', timeoutMs: 6000 });
     } catch (err) {

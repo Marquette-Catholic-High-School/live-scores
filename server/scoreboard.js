@@ -5,6 +5,10 @@
 // default on port 10001) or sends UDP datagrams to the server
 // (scoreboard-udp.js).
 //
+// Such a game also starts by itself: from its scheduled time the scoreboard
+// is watched, and the game starts as soon as the console sends data. It ends
+// by itself two minutes after the final horn.
+//
 // Read-only: nothing is ever written to the box - the Lantronix passes every
 // byte straight into the console. The box accepts one TCP connection at a
 // time, so the server connects only while a game needs the feed, shares that
@@ -13,7 +17,7 @@
 import dgram from 'node:dgram';
 import net from 'node:net';
 import { badRequest } from './errors.js';
-import { CONSOLE_RESET_REASON, computeScores, lastPeriodIndex } from './games.js';
+import { CONSOLE_RESET_REASON, FINAL_HORN_REASON, computeScores, gameLabel, lastPeriodIndex, overOnScoreboard } from './games.js';
 import { getSport } from './sports.js';
 import { RtdReader } from './rtd.js';
 import { UdpListeners } from './scoreboard-udp.js';
@@ -21,6 +25,10 @@ import { UdpListeners } from './scoreboard-udp.js';
 export const SCOREBOARD_SPORTS = Object.freeze(['basketball', 'volleyball']);
 export const DEFAULT_SCOREBOARD_PORT = 10001;
 export const DEFAULT_UDP_PORT = 21000;
+// A scheduled game starts by itself from its time until this long after it.
+export const AUTO_START_WINDOW_MS = 3 * 60 * 60 * 1000;
+// A game over on the scoreboard ends this long after the final horn.
+export const FINAL_HORN_HOLD_MS = 120_000;
 const DEFAULT_ADDRESS_KEY = 'scoreboard.defaultAddress';
 // The Lantronix box's own ports: some accept a TCP connection, none carries
 // the console's data. [first, last, what it is]
@@ -56,6 +64,10 @@ const TIMING = Object.freeze({
   // The console back at period 1 with lower scores while the game is further
   // on: it was reset for the next game before this one was ended.
   consoleResetHoldMs: 30_000,
+  // A scheduled game starts by itself only while its scoreboard sends: a
+  // data frame within this long.
+  autoStartDataMs: 5000,
+  finalHornHoldMs: FINAL_HORN_HOLD_MS,
 });
 // Longest valid input: a scheme and a bracketed full IPv6 address with a port.
 const MAX_ADDRESS_LENGTH = 70;
@@ -135,6 +147,29 @@ export function parseScoreboardSetting(value) {
   return parseScoreboardAddress(value, 'scoreboard');
 }
 
+// "Girls Varsity Basketball (Marquette vs Lincoln)", for messages.
+function describeGame(game) {
+  return `${gameLabel(game)} (${game.home.name} vs ${game.away.name})`;
+}
+
+// a starts before b when both are due on one scoreboard: the later
+// scheduled time, then the lower id.
+function startsFirst(a, b) {
+  return a.scheduledAt > b.scheduledAt || (a.scheduledAt === b.scheduledAt && a.id < b.id);
+}
+
+// A due game is passed over for good once `other`, scheduled no earlier on
+// the same scoreboard, has started since its time came.
+function passesOver(other, game) {
+  return other.id !== game.id && other.scheduledAt >= game.scheduledAt && other.startedAt >= game.scheduledAt;
+}
+
+// Of two live games on one scoreboard, a was started later (it wins the feed).
+function startedLater(a, b) {
+  const at = (game) => game.startedAt ?? 0;
+  return at(a) > at(b) || (at(a) === at(b) && a.id > b.id);
+}
+
 function sameTeam(team, ours) {
   const name = (value) => String(value ?? '').trim().toLowerCase();
   return team.code.toUpperCase() === ours.code.toUpperCase() || name(team.name) === name(ours.name);
@@ -150,6 +185,43 @@ export function scoreboardEligible(game, homeTeam) {
 function fieldsRead(game) {
   if (getSport(game.sport).scoreMode === 'sets') return 'Points and set';
   return game.options.clockEnabled ? 'Score, clock and period' : 'Score and period';
+}
+
+// Whether a reading still shows the game before on this scoreboard, for a
+// game at its start (#holdPreviousGame): at or beyond that game's last period,
+// or either team at or beyond its score there (`check.previous`, when known).
+// A game the scoreboard started also takes any period after the first for the
+// game before, and learns its display from it.
+function showsPreviousGame(check, reading) {
+  const known = (value) => value !== null && value !== undefined;
+  if (check.auto && known(reading.period) && reading.period > 1) {
+    check.previous = { period: reading.period, home: reading.home ?? check.previous?.home ?? 0, away: reading.away ?? check.previous?.away ?? 0 };
+    return true;
+  }
+  const previous = check.previous;
+  if (previous === null) return false;
+  return (
+    (known(reading.period) && reading.period >= previous.period) ||
+    (known(reading.home) && previous.home > 0 && reading.home >= previous.home) ||
+    (known(reading.away) && previous.away > 0 && reading.away >= previous.away)
+  );
+}
+
+// During a final-horn hold: the console set up for the next game, in
+// whatever order the operator does it - the period (game number) moved back,
+// or (points mode) a team's score cleared to 0. A volleyball game's points
+// cleared to 0-0 are held instead (#holdVolleyballClear).
+function settingUpNext(game, reading) {
+  if (reading.period !== null && reading.period - 1 < game.period) return true;
+  if (getSport(game.sport).scoreMode === 'sets') return false;
+  const scores = computeScores(game);
+  return (reading.home === 0 && scores.home > 0) || (reading.away === 0 && scores.away > 0);
+}
+
+function previousGameMessage(game) {
+  const sets = getSport(game.sport).scoreMode === 'sets';
+  const clock = !sets && game.options.clockEnabled ? ' Only the clock is read until then.' : '';
+  return `The scoreboard still shows the game before: this game's ${sets ? 'points and set' : 'score and period'} are read once the console is reset for it.${clock}`;
 }
 
 // The scorekeeper's status line for a feed's state (all but 'receiving').
@@ -214,9 +286,20 @@ class Feed {
     this.closed = false;
     this.volleyballReset = null;
     this.consoleReset = null;
+    // While the game is over on the scoreboard and about to end: { key, since }.
+    this.finalHorn = null;
+    this.timers = new Map(); // hold -> timer that reads the scoreboard again when it is over
+    // For the game at its start: what the console may still show from the
+    // game before (ScoreboardService #holdPreviousGame), worked out once.
+    this.startCheck = null;
+    this.previousGame = false; // the last reading still showed the game before
+    // Watching with the console off: the connection is being renewed, which
+    // is no failure.
+    this.renewing = false;
   }
 
-  open() {
+  // `quiet`: renewing a watching feed's connection, shown as no change.
+  open({ quiet = false } = {}) {
     if (this.closed || this.socket || this.subscription) return;
     if (this.transport === 'udp') {
       this.listen();
@@ -225,7 +308,7 @@ class Feed {
     const timing = this.service.timing;
     const socket = this.service.connect({ host: this.host, port: this.port });
     this.socket = socket;
-    this.setState('connecting');
+    if (!quiet) this.setState('connecting');
     socket.setTimeout(timing.connectTimeoutMs);
     socket.once('connect', () => {
       socket.setTimeout(0);
@@ -234,7 +317,7 @@ class Feed {
       this.lastDataAt = null;
       this.error = null;
       this.setState('waiting');
-      this.service.log?.info('scoreboard connected', { address: this.address });
+      this.service.log?.[quiet ? 'debug' : 'info']('scoreboard connected', { address: this.address });
     });
     socket.on('data', (chunk) => this.onData(chunk));
     socket.on('timeout', () => {
@@ -250,6 +333,13 @@ class Feed {
       this.socket = null;
       this.connectedAt = null;
       if (this.closed) return;
+      if (this.renewing) {
+        // Like every reconnect, from an empty block.
+        this.renewing = false;
+        this.reader = new RtdReader();
+        this.open({ quiet: true });
+        return;
+      }
       this.service.log?.warn('scoreboard connection lost', { address: this.address, error: this.error });
       this.error ??= 'the connection closed';
       this.setState('unreachable');
@@ -308,6 +398,7 @@ class Feed {
     clearTimeout(this.applyTimer);
     this.retryTimer = null;
     this.applyTimer = null;
+    this.clearTimers();
     if (this.socket) {
       const socket = this.socket;
       this.socket = null;
@@ -320,18 +411,52 @@ class Feed {
     }
   }
 
-  // A new game takes over this scoreboard: what the console sent for the
-  // previous one must not land in the new game.
+  // A new game takes over this scoreboard (or the feed only watches for a
+  // scheduled game to start: gameId null). A newer game taking over from a
+  // live one starts from an empty block: what the console sent for that game
+  // must not land in this one. A watch keeps what the console showed for the
+  // game that just ended, and the game that starts from it what the console
+  // shows now: what of it still shows the game before is held back
+  // (ScoreboardService #holdPreviousGame).
   assign(gameId) {
     if (this.gameId === gameId) return;
+    const takeover = this.gameId !== null && gameId !== null;
     this.gameId = gameId;
-    this.reader = new RtdReader();
-    this.datagrams = 0;
+    if (takeover) {
+      this.reader = new RtdReader();
+      this.datagrams = 0;
+    }
     this.volleyballReset = null;
     this.consoleReset = null;
+    this.finalHorn = null;
+    this.startCheck = null;
+    this.previousGame = false;
+    this.clearTimers();
     // The scorekeeper chose the scoreboard again after a reset was detected:
     // what it shows is what they want.
-    this.resetOverridden = this.service.resetOverridden(gameId);
+    this.resetOverridden = gameId !== null && this.service.resetOverridden(gameId);
+  }
+
+  // Reads the scoreboard again when a hold is over, even if the console stays
+  // quiet. One timer per hold; a new one replaces it.
+  recheckAfter(hold, ms) {
+    clearTimeout(this.timers.get(hold));
+    const timer = setTimeout(() => {
+      this.timers.delete(hold);
+      if (!this.closed && this.gameId !== null) this.service.applyReading(this);
+    }, ms);
+    timer.unref?.();
+    this.timers.set(hold, timer);
+  }
+
+  clearTimer(hold) {
+    clearTimeout(this.timers.get(hold));
+    this.timers.delete(hold);
+  }
+
+  clearTimers() {
+    for (const timer of this.timers.values()) clearTimeout(timer);
+    this.timers.clear();
   }
 
   onData(chunk) {
@@ -354,6 +479,9 @@ class Feed {
   apply() {
     this.applyTimer = null;
     this.firstPendingAt = null;
+    if (this.closed) return;
+    // Watching for a scheduled game: the console sending data starts it.
+    if (this.gameId === null) this.service.autoStart(this.address);
     if (this.closed || this.gameId === null) return;
     this.lastReadingAt = this.service.now();
     this.service.applyReading(this);
@@ -364,19 +492,31 @@ class Feed {
   setState(state) {
     if (this.state === state) return;
     this.state = state;
-    this.service.statusChanged(this.gameId);
+    this.service.feedChanged(this);
   }
 
   tick(now) {
     const timing = this.service.timing;
-    if (this.connectedAt === null) return;
+    // A final-horn hold that is over ends the game even if the console went
+    // quiet after the horn.
+    if (this.finalHorn !== null && this.gameId !== null && now - this.finalHorn.since >= timing.finalHornHoldMs) {
+      this.service.applyReading(this);
+    }
+    if (this.closed || this.connectedAt === null) return;
     const since = this.lastDataAt ?? this.connectedAt;
     if (this.state === 'receiving' && now - since > timing.quietAfterMs) this.setState('waiting');
     // A box sending over UDP has no connection to renew: it sends when the
-    // console does.
+    // console does. Watching for a game to start, a quiet console is just
+    // off: the connection is renewed (a box that rebooted would never be heard
+    // again otherwise) without calling that a failure or backing off.
     if (this.socket && now - since > timing.reconnectAfterQuietMs) {
-      this.service.log?.warn('scoreboard silent; reconnecting', { address: this.address });
-      this.error = 'no data from the scoreboard for a while';
+      if (this.gameId === null) {
+        this.renewing = true;
+        this.service.log?.debug('scoreboard quiet while watching; renewing the connection', { address: this.address });
+      } else {
+        this.service.log?.warn('scoreboard silent; reconnecting', { address: this.address });
+        this.error = 'no data from the scoreboard for a while';
+      }
       this.socket.destroy();
     }
   }
@@ -389,6 +529,9 @@ export class ScoreboardService {
   #feeds = new Map(); // address -> Feed
   #assigned = new Map(); // address -> id of the live game the scoreboard drives
   #standby = new Map(); // id of a game waiting behind a newer one -> that game's id
+  #held = new Map(); // address -> id of the live game holding the scoreboard (driven, or scored by hand by a person)
+  #due = new Map(); // address -> ids of the scheduled games due to start by themselves on it, the one to start first first
+  #watched = new Map(); // the part of #due on scoreboards no live game holds: their feeds are open, watching
   #tests = new Map(); // address -> in-flight test promise
   #testsRunning = new Set(); // finish() of each in-flight test
   #onStatus;
@@ -397,6 +540,7 @@ export class ScoreboardService {
   #stopped = false;
   #refreshing = false;
   #refreshAgain = false;
+  #timeFormat = null;
 
   constructor({
     db,
@@ -429,8 +573,11 @@ export class ScoreboardService {
     this.refresh();
     this.#ticker = setInterval(() => {
       const now = this.now();
-      for (const feed of this.#feeds.values()) feed.tick(now);
+      for (const feed of [...this.#feeds.values()]) feed.tick(now);
+      // Also opens the feeds of games whose time has come, and closes those
+      // whose window has passed.
       this.refresh();
+      for (const address of [...this.#watched.keys()]) this.autoStart(address);
     }, this.timing.tickMs);
     this.#ticker.unref?.();
   }
@@ -444,6 +591,9 @@ export class ScoreboardService {
     this.#feeds.clear();
     this.#assigned.clear();
     this.#standby.clear();
+    this.#held.clear();
+    this.#due.clear();
+    this.#watched.clear();
     // Tests in flight end with what they have; no socket outlives the service.
     for (const finish of [...this.#testsRunning]) finish();
     this.udp.closeAll();
@@ -496,7 +646,8 @@ export class ScoreboardService {
     return address !== null && this.#assigned.get(address) === game.id;
   }
 
-  // Recomputes which live game each scoreboard drives and opens or closes the
+  // Recomputes which live game each scoreboard drives, and which scoreboards
+  // are watched for a scheduled game to start, and opens or closes the
   // connections to match. Of several live games on one scoreboard the one
   // started last wins (an earlier game someone forgot to end must not take the
   // new game's scores); if that game is scored by hand, nobody gets the feed.
@@ -535,9 +686,7 @@ export class ScoreboardService {
       const address = this.addressFor(game);
       if (address === null) continue;
       const best = winners.get(address);
-      if (!best || (game.startedAt ?? 0) > (best.startedAt ?? 0) || ((game.startedAt ?? 0) === (best.startedAt ?? 0) && game.id > best.id)) {
-        winners.set(address, game);
-      }
+      if (!best || startedLater(game, best)) winners.set(address, game);
     }
     const assigned = new Map();
     const standby = new Map();
@@ -556,26 +705,48 @@ export class ScoreboardService {
       if (game && !game.scoreboardManual) this.#games.releaseScoreboard(gameId, 'a newer game took the scoreboard');
     }
 
+    // Scheduled games due to start by themselves: their scoreboard is
+    // watched while no live game holds it.
+    const held = this.#holders(candidates);
+    const due = new Map([...this.#dueGames(this.now())].map(([address, games]) => [address, games.map((game) => game.id)]));
+    const watched = new Map([...due].filter(([address]) => !held.has(address)));
+
     const touched = new Set();
     for (const [address, gameId] of this.#assigned) if (assigned.get(address) !== gameId) touched.add(gameId);
     for (const [address, gameId] of assigned) if (this.#assigned.get(address) !== gameId) touched.add(gameId);
     for (const [gameId, winnerId] of standby) if (this.#standby.get(gameId) !== winnerId) touched.add(gameId);
     for (const gameId of this.#standby.keys()) if (!standby.has(gameId)) touched.add(gameId);
+    // A due game's message names the live game holding its scoreboard and the
+    // game that starts first there: republish it when either changes.
+    const dueStates = (dues, holders) => {
+      const states = new Map();
+      for (const [address, ids] of dues) for (const id of ids) states.set(id, `${holders.get(address) ?? ''}:${ids[0]}`);
+      return states;
+    };
+    const dueBefore = dueStates(this.#due, this.#held);
+    const dueAfter = dueStates(due, held);
+    for (const [id, state] of dueBefore) if (dueAfter.get(id) !== state) touched.add(id);
+    for (const id of dueAfter.keys()) if (!dueBefore.has(id)) touched.add(id);
     this.#assigned = assigned;
     this.#standby = standby;
+    this.#held = held;
+    this.#due = due;
+    this.#watched = watched;
 
     for (const [address, feed] of this.#feeds) {
-      if (!assigned.has(address)) {
+      if (!assigned.has(address) && !watched.has(address)) {
         feed.close();
         this.#feeds.delete(address);
         this.log?.info('scoreboard disconnected', { address });
       }
     }
-    for (const [address, gameId] of assigned) {
+    for (const address of new Set([...assigned.keys(), ...watched.keys()])) {
+      const gameId = assigned.get(address) ?? null;
       let feed = this.#feeds.get(address);
       if (!feed) {
         feed = new Feed(this, address);
         this.#feeds.set(address, feed);
+        if (gameId === null) this.log?.info('scoreboard watched for a game due to start', { address, gameId: watched.get(address)[0] });
         feed.assign(gameId);
         feed.open();
       } else {
@@ -583,6 +754,46 @@ export class ScoreboardService {
       }
     }
     return touched;
+  }
+
+  // The live game holding each scoreboard (the newest): one it drives, or one
+  // a person scores by hand - the gym is in use either way; so does a game
+  // whose scoreboard was set to Off after the scoreboard read it (it holds the
+  // default one). A game the feed itself handed over to scoring by hand (the
+  // console was reset for another game, or a newer game took the scoreboard)
+  // holds nothing. `live`: the eligible live games.
+  #holders(live) {
+    const held = new Map();
+    for (const game of live) {
+      const address = game.scoreboard === 'off' ? (this.#games.readByScoreboard(game.id) ? this.defaultAddress() : null) : this.addressFor(game);
+      if (address === null) continue;
+      if (game.scoreboardManual && !this.#games.scoreboardManualByPerson(game.id)) continue;
+      const other = held.get(address);
+      if (!other || startedLater(game, other)) held.set(address, game);
+    }
+    return new Map([...held].map(([address, game]) => [address, game.id]));
+  }
+
+  // Scheduled games due to start by themselves (§11), by scoreboard, the one
+  // to start first first (latest scheduled time; tie: lower id): eligible, on
+  // a scoreboard, not scored by hand, from their time until
+  // AUTO_START_WINDOW_MS after it. A game is passed over for good once a game
+  // scheduled no earlier on the same scoreboard has started since its time
+  // came (it must not start after that game ends).
+  #dueGames(now) {
+    const from = now - AUTO_START_WINDOW_MS;
+    const started = this.#games.startedScheduledAfter(from).filter((game) => this.eligible(game));
+    const due = new Map();
+    for (const game of this.#games.scheduledBetween(from, now)) {
+      if (!this.eligible(game) || game.scoreboardManual) continue;
+      const address = this.addressFor(game);
+      if (address === null) continue;
+      if (started.some((other) => passesOver(other, game) && this.addressFor(other) === address)) continue;
+      if (!due.has(address)) due.set(address, []);
+      due.get(address).push(game);
+    }
+    for (const games of due.values()) games.sort((a, b) => (startsFirst(a, b) ? -1 : 1));
+    return due;
   }
 
   // Called after every game change; coalesced.
@@ -595,6 +806,13 @@ export class ScoreboardService {
     this.#refreshTimer.unref?.();
   }
 
+  // A feed's status changed: the game it drives shows it, or the games it
+  // watches for.
+  feedChanged(feed) {
+    if (feed.gameId !== null) this.statusChanged(feed.gameId);
+    else for (const id of this.#watched.get(feed.address) ?? []) this.statusChanged(id);
+  }
+
   statusChanged(gameId) {
     if (gameId === null || gameId === undefined) return;
     try {
@@ -602,6 +820,41 @@ export class ScoreboardService {
     } catch (err) {
       this.log?.error('scoreboard status listener failed', { err });
     }
+  }
+
+  // ---- starting by itself ----
+
+  // Starts the game due on this scoreboard once the console sends data
+  // (§11): on the tick, and whenever frames reach a feed watching for a game.
+  // The start goes through GameService like a scorekeeper's, so the
+  // push-to-start fan-out, SSE and broadcast channels follow as usual.
+  // Returns the game started, or null.
+  autoStart(address) {
+    if (this.#stopped) return null;
+    const feed = this.#feeds.get(address);
+    const [gameId] = this.#watched.get(address) ?? [];
+    if (!feed || feed.gameId !== null || gameId === undefined || !this.#sending(feed)) return null;
+    try {
+      return this.#games.autoStart(gameId, 'scoreboard', (game) => this.#mayStart(game, address))?.game ?? null;
+    } catch (err) {
+      this.log?.error('scoreboard could not start a game', { gameId, address, err });
+      return null;
+    }
+  }
+
+  // Inside the start's transaction, with what the database says now: the
+  // game is still the one to start on that scoreboard, no live game holds
+  // it, and it still sends data.
+  #mayStart(game, address) {
+    const feed = this.#feeds.get(address);
+    if (!feed || feed.closed || feed.gameId !== null || !this.#sending(feed)) return false;
+    if (this.#holders(this.#games.liveGames().filter((other) => this.eligible(other))).has(address)) return false;
+    return this.#dueGames(this.now()).get(address)?.[0]?.id === game.id;
+  }
+
+  // The scoreboard is on: a data frame arrived just now.
+  #sending(feed) {
+    return feed.lastDataAt !== null && this.now() - feed.lastDataAt <= this.timing.autoStartDataMs;
   }
 
   // ---- readings ----
@@ -615,11 +868,60 @@ export class ScoreboardService {
     if (!game || !this.controls(game)) return;
     const reading = feed.reader.reading(game.sport);
     if (this.#holdConsoleReset(feed, game, reading)) return;
+    this.#holdPreviousGame(feed, game, reading);
     if (game.sport === 'volleyball') this.#holdVolleyballClear(feed, game, reading);
+    let current = game;
     try {
-      this.#games.applyScoreboard(game.id, reading);
+      current = this.#games.applyScoreboard(game.id, reading) ?? game;
     } catch (err) {
       this.log?.warn('scoreboard reading not applied', { gameId: game.id, err: err.message });
+    }
+    this.#watchFinalHorn(feed, current);
+  }
+
+  // The final horn (§11): once the game is over on the scoreboard it ends by
+  // itself finalHornHoldMs later. A score change starts the hold again; the
+  // game going on (the clock set again, another period, a tie) cancels it.
+  #watchFinalHorn(feed, game) {
+    if (feed.closed || feed.gameId !== game.id) return;
+    const key = this.#overKey(feed, game);
+    if (key === null) {
+      if (feed.finalHorn === null) return;
+      feed.finalHorn = null;
+      feed.clearTimer('finalHorn');
+      this.log?.info('final horn: the game goes on', { gameId: game.id });
+      this.statusChanged(game.id);
+      return;
+    }
+    const now = this.now();
+    if (feed.finalHorn?.key !== key) {
+      this.log?.info(feed.finalHorn ? 'final horn: the score changed, holding again' : 'final horn: the game ends unless it goes on', { gameId: game.id });
+      feed.finalHorn = { key, since: now };
+      feed.recheckAfter('finalHorn', this.timing.finalHornHoldMs + 100);
+      this.statusChanged(game.id);
+      return;
+    }
+    if (now - feed.finalHorn.since >= this.timing.finalHornHoldMs) this.#endAtFinalHorn(feed, game);
+  }
+
+  // What the final-horn hold watches for changes (period and line) while the
+  // game is over on the scoreboard, else null. Whether the current period was
+  // played comes from the event log; a running hold already knows.
+  #overKey(feed, game) {
+    const key = JSON.stringify([game.period, game.line]);
+    const played = () => feed.finalHorn?.key === key || this.#games.playedInPeriod(game.id, { clock: getSport(game.sport).scoreMode === 'points' });
+    return overOnScoreboard(game, played) ? key : null;
+  }
+
+  // Ends the game with the score it has: no user, re-checked inside the
+  // transaction (still driven by this scoreboard, still over).
+  #endAtFinalHorn(feed, game) {
+    feed.finalHorn = null;
+    feed.clearTimer('finalHorn');
+    try {
+      this.#games.end(game.id, null, { auto: true, reason: FINAL_HORN_REASON, check: (current) => this.controls(current) && overOnScoreboard(current) });
+    } catch (err) {
+      this.log?.warn('game not ended at the final horn', { gameId: game.id, err: err.message });
     }
   }
 
@@ -627,8 +929,16 @@ export class ScoreboardService {
   // is further on: the operator set it up for the next game before this one
   // was ended. Nothing of it is applied; if it stays that way the game is
   // handed over to scoring by hand, keeping its score for the scorekeeper to
-  // end. Returns true while the reading is held back.
+  // end. While the game is about to end at the final horn, the console being
+  // set up for the next game in any order ends it at once, with the score it
+  // had then, and never hands it over. Returns true while the reading is held
+  // back.
   #holdConsoleReset(feed, game, reading) {
+    if (feed.finalHorn !== null && settingUpNext(game, reading)) {
+      this.log?.info('scoreboard reset for another game after the final horn; ending the game', { gameId: game.id });
+      this.#endAtFinalHorn(feed, game);
+      return true;
+    }
     let reset = false;
     if (reading.period === 1 && game.period > 0 && !feed.resetOverridden) {
       if (getSport(game.sport).scoreMode === 'sets') reset = reading.home === 0 && reading.away === 0;
@@ -647,17 +957,64 @@ export class ScoreboardService {
     if (feed.consoleReset === null) {
       feed.consoleReset = now;
       this.log?.info('scoreboard looks reset for another game; holding', { gameId: game.id });
-      setTimeout(() => feed.apply(), this.timing.consoleResetHoldMs + 100).unref?.();
+      feed.recheckAfter('consoleReset', this.timing.consoleResetHoldMs + 100);
     } else if (now - feed.consoleReset >= this.timing.consoleResetHoldMs) {
       this.#games.releaseScoreboard(game.id, CONSOLE_RESET_REASON);
     }
     return true;
   }
 
+  // Right after the start the console may still show the game before (§11):
+  // its final, not reset yet - a 6:30 game starts by itself while the 5:00
+  // game's final is still up. While this game is at its start (first period,
+  // no points), a reading that shows the game before lends this game only its
+  // clock; the score and period follow once the console shows this game (it
+  // was reset, or play began). Once it has shown 0-0 in the first period the
+  // check is done. A scorekeeper who chose Use the scoreboard turned it off:
+  // what it shows is what they want.
+  #holdPreviousGame(feed, game, reading) {
+    const atStart = game.period === 0 && game.line.every((entry) => entry.home === 0 && entry.away === 0);
+    let held = false;
+    if (atStart && !feed.startCheck?.done) {
+      feed.startCheck ??= this.#startCheck(game, feed.address);
+      held = !feed.startCheck.chosen && showsPreviousGame(feed.startCheck, reading);
+      if (!held && reading.home === 0 && reading.away === 0 && (reading.period ?? 1) === 1) feed.startCheck.done = true;
+    }
+    if (held) {
+      reading.period = null;
+      reading.home = null;
+      reading.away = null;
+    }
+    if (held === feed.previousGame) return;
+    feed.previousGame = held;
+    if (held) this.log?.info('scoreboard still shows the game before; reading only its clock', { gameId: game.id });
+    this.statusChanged(game.id);
+  }
+
+  // What #holdPreviousGame goes by: whether the scoreboard started the game
+  // (nobody saw the console then), whether a person chose the scoreboard for
+  // it, and the game before on this scoreboard's last period and score, if
+  // there is one: the latest game of the sport that ended there before this
+  // one started and got past its first period (one ended or canceled in its
+  // first period, e.g. started by mistake, is no final the console still shows).
+  #startCheck(game, address) {
+    const before = this.#games
+      .endedBefore(game.sport, game.startedAt ?? this.now())
+      .find((other) => other.id !== game.id && other.period > 0 && this.eligible(other) && this.addressFor(other) === address);
+    let previous = null;
+    if (before) {
+      // Volleyball: the points of the game (set) the console was on.
+      const scores = getSport(before.sport).scoreMode === 'sets' ? (before.line[before.period] ?? { home: 0, away: 0 }) : computeScores(before);
+      previous = { period: before.period + 1, home: scores.home, away: scores.away };
+    }
+    return { auto: this.#games.startedByScoreboard(game.id), chosen: this.#games.scoreboardChosenByPerson(game.id), previous, done: false };
+  }
+
   // Volleyball: points cleared to 0-0 in the same game are held, so the set
   // keeps its score when the operator clears the board before moving on. The
-  // console's own record of that game wins over 0-0, and the match's last
-  // set is never cleared (the game number can't move on past it).
+  // console's own record of that game wins over 0-0, and neither the match's
+  // last set (the game number can't move on past it) nor the set that won the
+  // match (about to end at the final horn) is ever cleared.
   #holdVolleyballClear(feed, game, reading) {
     const current = game.line[game.period] ?? { home: 0, away: 0 };
     const sameGame = reading.period === null || reading.period - 1 === game.period;
@@ -676,9 +1033,9 @@ export class ScoreboardService {
     if (feed.volleyballReset === null) {
       feed.volleyballReset = now;
       // Check again when the hold ends, even if the console stays quiet.
-      setTimeout(() => feed.apply(), this.timing.volleyballResetHoldMs + 100).unref?.();
+      feed.recheckAfter('volleyballClear', this.timing.volleyballResetHoldMs + 100);
     }
-    if (game.period >= lastPeriodIndex(game) || now - feed.volleyballReset < this.timing.volleyballResetHoldMs) {
+    if (game.period >= lastPeriodIndex(game) || feed.finalHorn !== null || now - feed.volleyballReset < this.timing.volleyballResetHoldMs) {
       reading.home = null;
       reading.away = null;
     }
@@ -714,13 +1071,17 @@ export class ScoreboardService {
     } else if (game.status === 'scheduled' && game.scoreboardManual) {
       view.state = 'manual';
       view.message = "This game will be scored by hand. The scoreboard isn't read.";
+    } else if (game.status === 'scheduled') {
+      // Every game that hasn't started is 'idle' (the clients rely on it);
+      // the message says when and how it starts.
+      view.state = 'idle';
+      view.message = this.#startMessage(game, address);
     } else if (game.status !== 'live') {
       view.state = 'idle';
-      view.message = game.status === 'scheduled' ? `Reads the scoreboard at ${address} once the game starts.` : '';
     } else if (this.#standby.has(game.id)) {
       const other = this.#games.getGame(this.#standby.get(game.id));
       view.state = 'standby';
-      view.message = `The scoreboard is driving ${other ? `${other.home.name} vs ${other.away.name}` : 'another game'}, which started later.`;
+      view.message = `The scoreboard is driving ${other ? describeGame(other) : 'another game'}, which started later.`;
     } else if (game.scoreboardManual) {
       view.state = 'manual';
       view.message = 'Scored by hand. The scoreboard feed is paused for this game.';
@@ -730,40 +1091,105 @@ export class ScoreboardService {
     } else {
       view.state = feed.state;
       view.lastReadingAt = feed.lastReadingAt;
-      view.message = feed.state === 'receiving' ? `${fieldsRead(game)} come from the scoreboard.` : feedMessage(feed.state, address, feed.error);
+      if (feed.gameId === game.id && feed.finalHorn !== null) view.message = this.#finalHornMessage(game, feed);
+      else if (feed.state !== 'receiving') view.message = feedMessage(feed.state, address, feed.error);
+      else if (feed.gameId === game.id && feed.previousGame) view.message = previousGameMessage(game);
+      else view.message = `${fieldsRead(game)} come from the scoreboard.`;
     }
     return view;
   }
 
+  // A scheduled game on a scoreboard: when it starts by itself, or why not.
+  #startMessage(game, address) {
+    const now = this.now();
+    const byHand = 'Start it by hand if it is played, or cancel it.';
+    if (now < game.scheduledAt) return `Starts automatically at ${this.#time(game.scheduledAt)} once the scoreboard at ${address} is on.`;
+    if (now >= game.scheduledAt + AUTO_START_WINDOW_MS) {
+      return `Won't start by itself any more: its time was more than ${AUTO_START_WINDOW_MS / 3_600_000} hours ago. ${byHand}`;
+    }
+    const due = this.#due.get(address) ?? [];
+    if (!due.includes(game.id)) {
+      const other = this.#games
+        .startedScheduledAfter(now - AUTO_START_WINDOW_MS)
+        .find((started) => this.eligible(started) && passesOver(started, game) && this.addressFor(started) === address);
+      if (other) return `Won't start by itself: ${describeGame(other)} started on this scoreboard after this game's time. ${byHand}`;
+      // Its time has only just come: the scoreboard is watched from the next refresh.
+      return `Starts automatically once the scoreboard is on. ${feedMessage('connecting', address, null)}`;
+    }
+    const holder = this.#held.get(address);
+    if (holder !== undefined) {
+      const other = this.#games.getGame(holder);
+      return `Starts automatically once ${other ? describeGame(other) : 'the live game on this scoreboard'} has ended: that game is still live on this scoreboard.`;
+    }
+    const [first] = due;
+    if (first !== game.id) {
+      const other = this.#games.getGame(first);
+      return `Not started automatically: ${other ? describeGame(other) : 'a game'}, scheduled later on this scoreboard, starts instead.`;
+    }
+    const feed = this.#feeds.get(address);
+    if (feed && feed.gameId === null && this.#sending(feed)) return 'The scoreboard is on: starting…';
+    const state = !feed || feed.gameId !== null ? 'connecting' : feed.state === 'receiving' ? 'waiting' : feed.state;
+    return `Starts automatically once the scoreboard is on. ${feedMessage(state, address, feed?.error ?? null)}`;
+  }
+
+  // Says when the game ends, not how long until then: an open page isn't
+  // sent the message again as time passes (only when the hold starts over).
+  #finalHornMessage(game, feed) {
+    const minutes = Math.round(this.timing.finalHornHoldMs / 60_000);
+    const after = `${minutes} minute${minutes === 1 ? '' : 's'}`;
+    // The end, rounded up to the minute: "by 7:43 PM".
+    const by = this.#time(Math.ceil((feed.finalHorn.since + this.timing.finalHornHoldMs) / 60_000) * 60_000);
+    if (getSport(game.sport).scoreMode === 'sets') return `Match won: the game ends by itself by ${by}, ${after} after the last point.`;
+    return `Final horn: the game ends by itself by ${by}, ${after} after the last score change. Time put back on the clock keeps it going.`;
+  }
+
+  // "5:00 PM" in the school's time zone.
+  #time(ms) {
+    this.#timeFormat ??= new Intl.DateTimeFormat('en-US', { timeZone: this.#config.timeZone, hour: 'numeric', minute: '2-digit' });
+    return this.#timeFormat.format(ms).replace(/\s/g, ' ');
+  }
+
+  // The open feeds: one per scoreboard a live game reads, and one per
+  // scoreboard watched for a scheduled game to start (`watching`, `gameId`
+  // = that game).
   status() {
-    return [...this.#assigned].map(([address, gameId]) => {
+    const entry = (address, gameId, watching) => {
       const feed = this.#feeds.get(address);
       return {
         address,
         gameId,
+        watching,
         state: feed?.state ?? 'connecting',
         error: feed?.state === 'unreachable' ? feed.error : null,
         lastReadingAt: feed?.lastReadingAt ?? null,
       };
-    });
+    };
+    const feeds = [...this.#assigned].map(([address, gameId]) => entry(address, gameId, false));
+    for (const [address, [gameId]] of this.#watched) if (!this.#assigned.has(address)) feeds.push(entry(address, gameId, true));
+    return feeds;
   }
 
   // ---- "Test connection" ----
 
   // Listens to a scoreboard for a few seconds and reports what it sends. Uses
-  // the feed's connection when a game is already reading this scoreboard (the
-  // box accepts one connection at a time). Over UDP the test shares the port's
-  // socket with any feed on it, so it never disturbs one.
+  // the feed's connection when a game is already reading this scoreboard, or
+  // it is watched for a game to start (the box accepts one connection at a
+  // time). Over UDP the test shares the port's socket with any feed on it, so
+  // it never disturbs one.
   test(value) {
     const address = parseScoreboardAddress(value);
     const feed = this.#feeds.get(address);
     if (feed) {
-      const game = this.#games.getGame(feed.gameId);
+      // A feed watching for a scheduled game: gameId is that game.
+      const watching = feed.gameId === null;
+      const gameId = watching ? (this.#watched.get(address)?.[0] ?? null) : feed.gameId;
+      const game = this.#games.getGame(gameId);
       const result = {
         address,
         transport: feed.transport,
         inUse: true,
-        gameId: feed.gameId,
+        gameId,
+        watching,
         connected: feed.connectedAt !== null,
         receiving: feed.state === 'receiving',
         error: feed.state === 'unreachable' ? feed.error : null,

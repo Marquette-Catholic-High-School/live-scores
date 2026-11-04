@@ -4,7 +4,7 @@
 import { mountAccountMenu } from './account.js';
 import { ApiError, api, fetchConfig, fetchSession, gameApiPath, loginUrl } from './api.js';
 import { formatClock, serverNow } from './clock.js';
-import { hasStarted, matchup, scoreboardFields, statusBadge, teamChip } from './render.js';
+import { hasStarted, matchup, scoreboardFields, startsByItself, statusBadge, teamChip, watchState } from './render.js';
 import { connectStream } from './sse.js';
 import { GameStore, coalesce } from './store.js';
 import {
@@ -19,6 +19,11 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const ALL_SCOPE_LIMIT = 500;
 const DEFAULT_AWAY_COLOR = '#4B5563';
 const BEST_OF = [3, 5];
+// The team a game is for (server/games.js GENDERS, LEVELS), sent as gender
+// and level (null: not set). The game's label, "sportName", puts them before
+// the sport's name: "Girls JV Basketball".
+const GENDERS = [['boys', 'Boys'], ['girls', 'Girls']];
+const LEVELS = [['varsity', 'Varsity'], ['jv', 'JV'], ['freshman', 'Freshman']];
 // The sports the Daktronics scoreboard feed can drive (server/scoreboard.js).
 const SCOREBOARD_SPORTS = ['basketball', 'volleyball'];
 // Scoreboard feed states (ARCHITECTURE.md §11) as the games list and the
@@ -54,6 +59,9 @@ async function loadScoreboardSettings() {
   scoreboardSettings = await api('/api/admin/scoreboard');
   return scoreboardSettings;
 }
+
+// "MAR vs LIN, Girls JV Basketball": a girls' and a boys' game can share a matchup.
+const gameName = (game) => `${matchup(game)}, ${game.sportName}`;
 
 function handleError(err, prefix = '') {
   if (err instanceof ApiError && err.status === 401) {
@@ -297,6 +305,22 @@ function gameFormDialog(game = null) {
       const sportIds = Object.keys(sports);
       const sport = select(sportIds.map((id) => [id, sports[id].name]), { required: true, disabled: locked });
       sport.value = game?.sport ?? sportIds[0];
+      // Boys / girls and the level can be changed in any status.
+      const gender = select([['', 'Not set'], ...GENDERS]);
+      const level = select([['', 'Not set'], ...LEVELS]);
+      gender.value = game?.gender ?? '';
+      level.value = game?.level ?? '';
+      const shownLabel = [gender.value, level.value];
+      // The label as every client shows it. Live Activities keep the one they
+      // started with (ActivityKit attributes are fixed).
+      const labelHint = el('p', { class: 'field__hint' });
+      const syncLabel = () => {
+        const name = (choices, value) => choices.find(([key]) => key === value)?.[1];
+        const label = [name(GENDERS, gender.value), name(LEVELS, level.value), sports[sport.value].name].filter(Boolean).join(' ');
+        labelHint.textContent = `Shown as “${label}” in the app, on Lock Screens and on the web.${game?.status === 'live' ? ' Live Activities already showing keep the name they started with.' : ''}`;
+      };
+      syncLabel();
+      for (const input of [sport, gender, level]) input.addEventListener('change', syncLabel);
 
       // New games default to 6:00 PM tomorrow, school time.
       const when = game?.scheduledAt ?? fromDateTimeInputs(toDateInputValue(serverNow() + DAY_MS), '18:00');
@@ -391,10 +415,14 @@ function gameFormDialog(game = null) {
       };
       // Only basketball and volleyball, and only with the school's team at
       // home (its name or code, as the server compares them). The hint says
-      // what the scoreboard sets for the sport and clock chosen.
+      // what the scoreboard sets for the sport and clock chosen, and that it
+      // starts the game and ends it at the final horn (a game without a clock
+      // is ended by hand).
       const syncFeed = () => {
+        const rules = sports[sport.value];
         feedSet.hidden = !SCOREBOARD_SPORTS.includes(sport.value);
-        feedHint.textContent = `While the game is live, its ${scoreboardFields(sports[sport.value], clockOn.checked)} come from the gym’s Daktronics scoreboard.`;
+        const end = rules.scoreMode === 'sets' ? ', and ends 2 minutes after the match is won' : clockOn.checked ? ', and ends 2 minutes after the final horn' : '';
+        feedHint.textContent = `While the game is live, its ${scoreboardFields(rules, clockOn.checked)} come from the gym’s Daktronics scoreboard. It starts by itself at its start time once the scoreboard is on${end}.`;
         const custom = feedChoices.custom.input.checked;
         feedAddressField.hidden = !custom;
         feedTarget.setDisabled(feedSet.hidden || !custom);
@@ -432,8 +460,11 @@ function gameFormDialog(game = null) {
       const form = el(
         'form',
         { class: 'stack', novalidate: true, id: formId },
-        locked ? el('p', { class: 'notice notice--info', text: 'This game has started, so its sport and teams are locked (Live Activities already show them).' }) : null,
-        el('div', { class: 'form-grid' }, field('Sport', sport), field('Date', date), timeField),
+        locked ? el('p', { class: 'notice notice--info', text: 'This game has started, so its sport and its home and away teams are locked (Live Activities already show them). Boys / Girls and Level can still be changed.' }) : null,
+        el('div', { class: 'stack stack--sm' },
+          el('div', { class: 'form-grid form-grid--sport' }, field('Sport', sport, { className: 'field--wide' }), field('Boys / Girls', gender), field('Level', level)),
+          labelHint),
+        el('div', { class: 'form-grid' }, field('Date', date), timeField),
         field('Location', venue),
         home.root,
         away.root,
@@ -460,6 +491,8 @@ function gameFormDialog(game = null) {
         // hold whole minutes (and the first of a repeated fall-back hour), so
         // re-sending them could move a game that wasn't meant to move.
         if (!editing || date.value !== shownWhen[0] || time.value !== shownWhen[1]) payload.scheduledAt = scheduledAt;
+        if (!editing || gender.value !== shownLabel[0]) payload.gender = gender.value || null;
+        if (!editing || level.value !== shownLabel[1]) payload.level = level.value || null;
         if (!locked) {
           payload.sport = sport.value;
           payload.home = home.value();
@@ -600,8 +633,14 @@ class GamesPanel {
     const holder = game.scorekeeper;
     const mine = holder?.id === user.id;
     const team = (side) => el('span', { class: 'arow__team' }, teamChip(game[side]), el('span', { text: game[side].name }), started ? el('strong', { class: 'arow__score', text: String(game[side].score) }) : null);
-    const feed = game.status === 'live' ? game.scoreboard : null;
-    const feedState = feed ? feedStateLabel(feed.state, feed.address) : undefined;
+    // A live game shows its feed's state; a scheduled one whether the
+    // scoreboard starts it (the message, as the title, says when) and, once
+    // its time has come, a scoreboard it can't reach or that sends nothing.
+    const feed = open ? game.scoreboard : null;
+    const auto = game.status === 'scheduled' && startsByItself(feed);
+    const state = auto ? watchState(feed) : feed?.state;
+    const warn = state === 'unreachable' || state === 'waiting';
+    const feedState = !feed ? undefined : auto ? ['starts automatically', warn && feedStateLabel(state, feed.address)].filter(Boolean).join(' · ') : feedStateLabel(feed.state, feed.address);
 
     const actions = [
       el('button', { type: 'button', class: 'btn btn--sm', text: 'Edit', on: { click: () => gameFormDialog(game) } }),
@@ -639,7 +678,7 @@ class GamesPanel {
           el('span', { text: game.sportName }),
           game.location ? el('span', { text: game.location }) : null,
           el('span', { class: 'arow__holder', text: holder ? `Scorekeeper: ${mine ? 'you' : holder.name}` : open ? 'Unclaimed' : 'No scorekeeper' }),
-          feedState ? el('span', { class: ['arow__feed', (feed.state === 'unreachable' || feed.state === 'waiting') && 'is-warn'], title: feed.message, text: `Scoreboard: ${feedState}` }) : null,
+          feedState ? el('span', { class: ['arow__feed', warn && 'is-warn'], title: feed.message, text: `Scoreboard: ${feedState}` }) : null,
         ),
       ),
       el('div', { class: 'arow__actions' }, actions),
@@ -1170,7 +1209,7 @@ class ScoreboardCard {
       'section',
       { class: 'card' },
       el('div', { class: 'card__head' }, el('h3', { class: 'card__title', text: 'Daktronics scoreboard' }), this.badge),
-      el('p', { class: 'card__text', text: `While a basketball or volleyball game with ${config.homeTeam.name} at home is live, its score, clock and period (for volleyball, the points and set) come from the gym’s scoreboard. The server only reads from the box, and the box accepts one connection at a time.` }),
+      el('p', { class: 'card__text', text: `While a basketball or volleyball game with ${config.homeTeam.name} at home is live, its score, clock and period (for volleyball, the points and set) come from the gym’s scoreboard. The game starts by itself at its start time once the scoreboard is on, and ends 2 minutes after the final horn (for volleyball, after the match is won). The server only reads from the box, and the box accepts one connection at a time.` }),
       form,
       this.testResults,
       el('h4', { class: 'card__subtitle', text: 'Live feeds' }),
@@ -1210,11 +1249,16 @@ class ScoreboardCard {
       el('thead', {}, el('tr', {}, ['Address', 'Game', 'State', 'Last reading'].map((h) => el('th', { scope: 'col', text: h })))),
       el('tbody', {}, feeds.map((feed) => {
         const game = store.get(feed.gameId);
+        // The game's label, and for a feed `watching` for a scheduled game to
+        // start (§11, nothing is applied yet) that it starts once the console is on.
+        const about = [game?.sportName, feed.watching && 'starts once the scoreboard is on'].filter(Boolean).join(' · ');
         return el(
           'tr',
           { class: feed.state === 'unreachable' ? 'is-failed' : null },
           el('td', { class: 'mono', text: feed.address }),
-          el('td', {}, el('a', { href: `/keeper?game=${encodeURIComponent(feed.gameId)}`, text: game ? matchup(game) : feed.gameId })),
+          el('td', { class: 'wrap' },
+            el('a', { href: `/keeper?game=${encodeURIComponent(feed.gameId)}`, text: game ? matchup(game) : feed.gameId }),
+            about ? el('span', { class: 'table__sub', text: about }) : null),
           el('td', { class: 'wrap' }, el('span', { class: 'table__main', text: capitalize(feedStateLabel(feed.state, feed.address) ?? feed.state) }), feed.error ? el('span', { class: 'table__sub', text: feed.error }) : null),
           el('td', { text: feed.lastReadingAt ? formatTimestamp(feed.lastReadingAt) : '—' }),
         );
@@ -1289,10 +1333,16 @@ class ScoreboardCard {
     const udp = result.transport === 'udp';
     const { checks, steps = null } = udp ? udpTestChecks(result) : tcpTestChecks(result);
     const game = result.gameId ? store.get(result.gameId) : null;
+    // A feed in use by a live game, or watching for a scheduled one to start (§11).
+    const name = game ? gameName(game) : result.gameId;
+    const read = udp ? 'feed has received' : 'connection has read';
+    const inUse = result.watching
+      ? `In use by a game that starts once the scoreboard is on (${name}). This is what the ${read}.`
+      : `In use by a live game (${name}). This is what that game’s ${read}.`;
     return el(
       'div',
       { class: 'stack' },
-      result.inUse ? el('p', { class: 'notice notice--info', text: `In use by a live game (${game ? matchup(game) : result.gameId}). This is what that game’s ${udp ? 'feed has received' : 'connection has read'}.` }) : null,
+      result.inUse ? el('p', { class: 'notice notice--info', text: inUse }) : null,
       el('ul', { class: 'check-list' }, checks),
       steps,
       result.frames > 0 ? scoreboardReading(result.reading) : null,
@@ -1387,7 +1437,7 @@ class SystemPanel {
       el('div', { class: 'card__head' }, el('h3', { class: 'card__title', text: 'Apple Push Notifications' }),
         el('span', { class: ['badge', apns.configured ? 'badge--ok' : 'badge--canceled'], text: apns.configured ? 'Configured' : 'Not configured' })),
       apns.configured
-        ? el('p', { class: 'card__text', text: 'Starting a game sends a Live Activity to every iPhone with Sports Updates on; every score change updates them.' })
+        ? el('p', { class: 'card__text', text: 'Starting a game sends a Live Activity to every iPhone with the MCHS app that hasn’t turned Live Activities off; every score change updates them.' })
         : el('p', { class: 'notice notice--warn', text: `Live Activities are off (${String(apns.error ?? 'the APNs key, Key ID or Team ID is missing').replace(/\.$/, '')}). Scores still update on the web and in the app.` }),
       keyValues([
         ['Team ID', el('span', { class: 'mono', text: apns.teamId ?? '—' })],
@@ -1417,7 +1467,7 @@ class SystemPanel {
         el('thead', {}, el('tr', {}, el('th', { scope: 'col', text: 'Environment' }), el('th', { scope: 'col', class: 'num', text: 'Receiving' }), el('th', { scope: 'col', class: 'num', text: 'Total' }), el('th', { scope: 'col', class: 'num', text: 'Invalid' }))),
         el('tbody', {}, deviceRows),
       )),
-      el('p', { class: 'field__hint', text: '“Receiving” counts iPhones with Sports Updates and Live Activities turned on. Invalid tokens are removed after 30 days.' }),
+      el('p', { class: 'field__hint', text: '“Receiving” counts iPhones with Live Activities on, both in the MCHS app and in iOS Settings. Invalid tokens are removed after 30 days.' }),
     );
 
     const stats = el(

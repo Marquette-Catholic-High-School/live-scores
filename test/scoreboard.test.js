@@ -5,6 +5,10 @@ import { FIELDS, encodeField, encodeFrame } from '../server/rtd.js';
 import { parseScoreboardAddress } from '../server/scoreboard.js';
 import { act, createGame, startGame, startTestApp, waitFor } from './helpers.js';
 
+// Games these tests start by hand are scheduled an hour ahead: a game whose
+// time has come starts by itself once its scoreboard sends data.
+const AHEAD = 3_600_000;
+
 const FAST = {
   connectTimeoutMs: 500,
   retryDelaysMs: [50, 100],
@@ -124,7 +128,7 @@ describe('Daktronics scoreboard feed', () => {
   });
 
   it('drives a live basketball game: score, period and clock; scorekeeper buttons are locked', async () => {
-    const game = await createGame(admin, { scheduledAt: Date.now() });
+    const game = await createGame(admin, { scheduledAt: Date.now() + AHEAD });
     assert.equal(game.scoreboard.setting, 'default');
     assert.equal(game.scoreboard.state, 'idle');
     assert.equal(board.open, 0, 'no connection before the game starts');
@@ -195,8 +199,8 @@ describe('Daktronics scoreboard feed', () => {
   });
 
   it('only drives basketball and volleyball games with the school at home', async () => {
-    const away = await createGame(admin, { scheduledAt: Date.now(), home: { name: 'Lincoln', code: 'LIN', color: '#B22234' }, away: { name: 'Marquette', code: 'MAR', color: '#12214D' } });
-    const football = await createGame(admin, { scheduledAt: Date.now(), sport: 'football' });
+    const away = await createGame(admin, { scheduledAt: Date.now() + AHEAD, home: { name: 'Lincoln', code: 'LIN', color: '#B22234' }, away: { name: 'Marquette', code: 'MAR', color: '#12214D' } });
+    const football = await createGame(admin, { scheduledAt: Date.now() + AHEAD, sport: 'football' });
     for (const game of [away, football]) {
       await startGame(admin, game.id);
       const live = (await admin.get(`/api/games/${game.id}`)).json.game;
@@ -210,11 +214,11 @@ describe('Daktronics scoreboard feed', () => {
   });
 
   it('gives the scoreboard to the game started last; per-game address and off', async () => {
-    const first = await createGame(admin, { scheduledAt: Date.now() });
+    const first = await createGame(admin, { scheduledAt: Date.now() + AHEAD });
     await startGame(admin, first.id);
     await waitFor(() => board.open === 1);
     t.clock.advance(60_000);
-    const second = await createGame(admin, { scheduledAt: Date.now(), sport: 'volleyball' });
+    const second = await createGame(admin, { scheduledAt: Date.now() + AHEAD, sport: 'volleyball' });
     await startGame(admin, second.id);
     let older = await waitForGame(admin, first.id, (g) => g.scoreboard.state === 'standby', 'older game stands by');
     assert.match(older.scoreboard.message, /started later/);
@@ -255,7 +259,7 @@ describe('Daktronics scoreboard feed', () => {
   });
 
   it('drives volleyball: game number, points, finished games, and a held 0-0 reset', async () => {
-    const game = await createGame(admin, { scheduledAt: Date.now(), sport: 'volleyball', options: { bestOf: 3 } });
+    const game = await createGame(admin, { scheduledAt: Date.now() + AHEAD, sport: 'volleyball', options: { bestOf: 3 } });
     await startGame(admin, game.id);
     await waitFor(() => board.open === 1);
     board.send(...score(24, 20), period(1));
@@ -278,7 +282,7 @@ describe('Daktronics scoreboard feed', () => {
   });
 
   it('reconnects when the box drops the connection', async () => {
-    const game = await createGame(admin, { scheduledAt: Date.now() });
+    const game = await createGame(admin, { scheduledAt: Date.now() + AHEAD });
     await startGame(admin, game.id);
     await waitFor(() => board.open === 1);
     const before = board.connections;
@@ -307,7 +311,7 @@ describe('Daktronics scoreboard feed', () => {
       assert.equal(idle.json.result.reading.home, 1);
       await waitFor(() => board.open === 0, { message: 'the test closes its connection' });
 
-      const game = await createGame(admin, { scheduledAt: Date.now() });
+      const game = await createGame(admin, { scheduledAt: Date.now() + AHEAD });
       await startGame(admin, game.id);
       await waitFor(() => board.open === 1);
       const before = board.connections;
@@ -349,7 +353,7 @@ describe('Daktronics scoreboard feed: review cases', () => {
   const scoreboardEvents = (id) => t.app.db.get("SELECT COUNT(*) AS n FROM game_events WHERE game_id = ? AND type = 'scoreboard'", id).n;
 
   it('is controlling as soon as the game starts', async () => {
-    const game = await createGame(admin, { scheduledAt: Date.now() });
+    const game = await createGame(admin, { scheduledAt: Date.now() + AHEAD });
     const started = await startGame(admin, game.id);
     assert.equal(started.game.scoreboard.controlling, true);
     assert.equal(started.game.scoreboard.state, 'connecting');
@@ -358,7 +362,7 @@ describe('Daktronics scoreboard feed: review cases', () => {
   });
 
   it('reaches any total the console shows, and writes only real changes', async () => {
-    const game = await createGame(admin, { scheduledAt: Date.now() });
+    const game = await createGame(admin, { scheduledAt: Date.now() + AHEAD });
     await startGame(admin, game.id);
     await waitFor(() => board.open === 1);
     board.send(...score(10, 8), period(2));
@@ -378,7 +382,8 @@ describe('Daktronics scoreboard feed: review cases', () => {
   });
 
   it('keeps a finished game when the console is reset for the next one', async () => {
-    const game = await createGame(admin, { scheduledAt: Date.now() });
+    // Without a game clock it doesn't end at the final horn by itself.
+    const game = await createGame(admin, { scheduledAt: Date.now() + AHEAD, options: { clockEnabled: false } });
     await startGame(admin, game.id);
     await waitFor(() => board.open === 1);
     board.send(...score(52, 47), period(4), clockFrame('0:00', { running: false }));
@@ -401,7 +406,7 @@ describe('Daktronics scoreboard feed: review cases', () => {
   });
 
   it('volleyball: never clears the deciding set, uses the console record, ignores games past the match', async () => {
-    const game = await createGame(admin, { scheduledAt: Date.now(), sport: 'volleyball', options: { bestOf: 3 } });
+    const game = await createGame(admin, { scheduledAt: Date.now() + AHEAD, sport: 'volleyball', options: { bestOf: 3 } });
     await startGame(admin, game.id);
     await waitFor(() => board.open === 1);
     board.send(...score(25, 20), period(1));
@@ -428,10 +433,13 @@ describe('Daktronics scoreboard feed: review cases', () => {
   });
 
   it('volleyball: a clear in the same game uses the console record of that game', async () => {
-    const game = await createGame(admin, { scheduledAt: Date.now(), sport: 'volleyball', options: { bestOf: 5 } });
+    const game = await createGame(admin, { scheduledAt: Date.now() + AHEAD, sport: 'volleyball', options: { bestOf: 5 } });
     await startGame(admin, game.id);
     await waitFor(() => board.open === 1);
-    board.send(...score(24, 22), period(1));
+    // New game on the console (the match before ended at 15-11 in game 3).
+    board.send(...score(0, 0), period(1));
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    board.send(...score(24, 22));
     await waitForGame(admin, game.id, (g) => g.line[0]?.home === 24, 'set 1');
     board.send(...volleyballGame(1, 26, 24), ...score(0, 0));
     const live = await waitForGame(admin, game.id, (g) => g.line[0].home === 26, 'record applied instead of 0-0');
@@ -450,7 +458,7 @@ describe('Daktronics scoreboard feed: review cases', () => {
     try {
       fast.app.scoreboard.start();
       const boss = await fast.signedIn('boss2', 'admin');
-      const game = await createGame(boss, { scheduledAt: Date.now(), scoreboard: `127.0.0.1:${flapping.address().port}` });
+      const game = await createGame(boss, { scheduledAt: Date.now() + AHEAD, scoreboard: `127.0.0.1:${flapping.address().port}` });
       await startGame(boss, game.id);
       await new Promise((resolve) => setTimeout(resolve, 1000));
       assert.ok(accepted <= 6, `backed off (${accepted} connections in 1 s)`);

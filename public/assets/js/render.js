@@ -31,6 +31,25 @@ export function scoreboardFields(rules, clockEnabled) {
   return rules?.clock?.available && clockEnabled ? 'score, clock and period' : 'score and period';
 }
 
+// Whether the scoreboard starts a scheduled game by itself (§11). Only the
+// message says so (server/scoreboard.js #startMessage): "Starts automatically
+// …" or "The scoreboard is on: starting…". Otherwise it doesn't: scored by
+// hand, past its window, passed over, or another game there starts instead.
+export function startsByItself(feed) {
+  return feed?.state === 'idle' && /^(Starts automatically|The scoreboard is on)/.test(feed.message);
+}
+
+// Once such a game's time has come, the state of the feed watching for the
+// scoreboard to come on, as the rest of that message puts it (feedMessage):
+// 'connecting', 'unreachable' or 'waiting' (no data). null before its time,
+// while a live game still holds the scoreboard, or once it is on.
+export function watchState(feed) {
+  const rest = /^Starts automatically once the scoreboard is on\. (.+)/.exec(feed?.message ?? '')?.[1];
+  if (!rest) return null;
+  if (rest.startsWith("Can't ")) return 'unreachable';
+  return rest.includes('waiting for data') ? 'waiting' : 'connecting';
+}
+
 // Sports played in half-innings (baseball) list their regulation periods as
 // alternating ▲/▼ entries; their line score groups two periods per inning.
 export function isHalfInnings(rules) {

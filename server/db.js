@@ -152,6 +152,13 @@ const MIGRATIONS = [
     updated_at INTEGER NOT NULL
   );
   `,
+  // 4: the team a game is for (§4, §6): gender 'boys' | 'girls' and level
+  // 'varsity' | 'jv' | 'freshman', NULL = not set. Existing games get NULL
+  // (their label is just the sport's name).
+  `
+  ALTER TABLE games ADD COLUMN gender TEXT;
+  ALTER TABLE games ADD COLUMN level TEXT;
+  `,
 ];
 
 export class Database {

@@ -13,6 +13,7 @@ import {
   getSport,
   maxPeriodIndex,
   periodClockMinutes,
+  periodCount,
   periodInfo,
   rulesFor,
   volleyballBestOfValues,
@@ -42,6 +43,14 @@ const SCOREBOARD_TYPES = Object.freeze(['score', 'set_score', 'period', 'clock',
 // to the scoreboard's time (the console sends whole seconds over a minute).
 const CLOCK_RESYNC_MS = 1500;
 export const CONSOLE_RESET_REASON = 'the scoreboard was reset for another game';
+export const FINAL_HORN_REASON = 'final horn';
+// The team a game is for (§6), as stored -> as shown in its label.
+export const GENDERS = Object.freeze({ boys: 'Boys', girls: 'Girls' });
+export const LEVELS = Object.freeze({ varsity: 'Varsity', jv: 'JV', freshman: 'Freshman' });
+// Volleyball: a set is won at 25 points, by 2. IHSA plays every set to 25,
+// the deciding one too (NFHS' 15-point deciding set, played elsewhere, then
+// never counts as won here: such a match is ended by hand).
+const SET_POINTS = 25;
 const ACTION_ID_PATTERN = /^[\x21-\x7e]{8,64}$/;
 const SCOPES = ['board', 'all'];
 const ALL_SCOPE_LIMIT = 500;
@@ -61,6 +70,8 @@ function rowToGame(row) {
   return {
     id: row.id,
     sport: row.sport,
+    gender: row.gender ?? null,
+    level: row.level ?? null,
     home: { name: row.home_name, code: row.home_code, color: row.home_color },
     away: { name: row.away_name, code: row.away_code, color: row.away_color },
     location: row.location,
@@ -175,6 +186,46 @@ export function lastPeriodIndex(game) {
   return max === null ? MAX_PERIODS - 1 : Math.min(max, MAX_PERIODS - 1);
 }
 
+// The game's display label (§6), shown everywhere as "sportName": "Girls JV
+// Basketball", "Boys Varsity Volleyball", "Freshman Basketball", or just the
+// sport's name when neither is set.
+export function gameLabel(game) {
+  const part = (labels, value) => (typeof value === 'string' && Object.hasOwn(labels, value) ? labels[value] : null);
+  return [part(GENDERS, game.gender), part(LEVELS, game.level), getSport(game.sport).name].filter(Boolean).join(' ');
+}
+
+// Volleyball: how a team has won the match, if it has: 'sets' (the finished
+// sets as computeScores counts them), 'current' (the current set, once won,
+// decides it), else null.
+function matchWon(game) {
+  const needed = Math.ceil(periodCount(game.sport, game.options) / 2);
+  const scores = computeScores(game);
+  if (scores.home >= needed || scores.away >= needed) return 'sets';
+  const current = game.line[game.period] ?? { home: 0, away: 0 };
+  if (Math.max(current.home, current.away) < SET_POINTS || Math.abs(current.home - current.away) < 2) return null;
+  return scores[current.home > current.away ? 'home' : 'away'] + 1 >= needed ? 'current' : null;
+}
+
+// True once the game is over on the scoreboard (§11 "Final horn"):
+// basketball with the clock stopped at 0:00 in the last quarter or an
+// overtime, not tied; volleyball once a team has won the match (matchWon). A
+// game without a clock never is. `played()` is asked only when the current
+// period decides it: was the game played there (the clock ran; points were
+// scored after the set began)? 0:00 right after the console moved on to the
+// 4th quarter, or a set's points still showing when the console moved on to
+// the next set, are not the end.
+export function overOnScoreboard(game, played = () => true) {
+  if (game.status !== 'live') return false;
+  const count = periodCount(game.sport, game.options);
+  if (getSport(game.sport).scoreMode === 'sets') {
+    const won = matchWon(game);
+    return won === 'sets' || (won === 'current' && played());
+  }
+  if (game.period < count - 1 || game.clock.ms !== 0 || game.clock.running) return false;
+  const scores = computeScores(game);
+  return scores.home !== scores.away && played();
+}
+
 function currentLineEntry(game) {
   while (game.line.length <= game.period) game.line.push({ home: 0, away: 0 });
   return game.line[game.period];
@@ -233,9 +284,13 @@ function applyScoreboardReading(game, reading, now) {
   const known = (value) => value !== null && value !== undefined;
 
   // The period first: moving resets the clock, which the reading then sets.
+  // Sets mode: once the match is won, the console moving on to the next game
+  // number is ignored, and so are that game's points (below): a won match
+  // never gains a set.
   if (known(reading.period)) {
     const target = reading.period - 1;
-    if (target !== game.period && target >= 0 && target <= lastPeriodIndex(game)) {
+    const pastTheMatch = sport.scoreMode === 'sets' && target > game.period && matchWon(game) !== null;
+    if (!pastTheMatch && target !== game.period && target >= 0 && target <= lastPeriodIndex(game)) {
       const step = target > game.period ? 1 : -1;
       while (game.period !== target) movePeriod(game, step, now);
       changes.period = target;
@@ -336,6 +391,16 @@ function validateLocation(value) {
   return string(value, 'location', { max: LOCATION_MAX_LENGTH });
 }
 
+// gender / level: one of the stored values, or null (not set).
+function validateTeamLabel(value, field, labels) {
+  if (value === null) return null;
+  if (typeof value !== 'string' || !Object.hasOwn(labels, value)) {
+    const names = Object.keys(labels).map((key) => `"${key}"`);
+    throw badRequest(`${field} must be ${names.join(', ')} or null.`);
+  }
+  return value;
+}
+
 // Merges option input over `base`. Values are always type/range checked;
 // options that don't apply to the sport (e.g. bestOf for basketball, a clock
 // for baseball) are ignored so a generic form can send every field.
@@ -374,12 +439,14 @@ function validateActionId(value) {
 
 // ---- Live Activity payload pieces (§8.5) -----------------------------------
 
+// Fixed for the life of an activity: editing a live game's gender or level
+// changes only the activities started after the edit.
 export function activityAttributes(game) {
   const sport = getSport(game.sport);
   return {
     gameId: game.id,
     sport: game.sport,
-    sportName: sport.name,
+    sportName: gameLabel(game),
     symbol: sport.symbol,
     homeName: game.home.name,
     homeCode: game.home.code,
@@ -526,6 +593,28 @@ export class GameService {
     return this.#db.all(`${GAME_SELECT} WHERE g.status = 'live'`).map(rowToGame);
   }
 
+  // Scheduled games with from < scheduledAt <= to (the scoreboard's auto-start window).
+  scheduledBetween(from, to) {
+    return this.#db.all(`${GAME_SELECT} WHERE g.status = 'scheduled' AND g.scheduled_at > ? AND g.scheduled_at <= ?`, from, to).map(rowToGame);
+  }
+
+  // Games scheduled after `from` that have started (live, final, or canceled while live).
+  startedScheduledAfter(from) {
+    return this.#db.all(`${GAME_SELECT} WHERE g.started_at IS NOT NULL AND g.scheduled_at > ?`, from).map(rowToGame);
+  }
+
+  // The latest `sport` games that were played and ended (final, or canceled
+  // while live) by `before`, newest first: what a scoreboard may still show.
+  endedBefore(sport, before, limit = 20) {
+    return this.#db
+      .all(
+        `${GAME_SELECT} WHERE g.sport = ? AND g.status IN ('final', 'canceled') AND g.started_at IS NOT NULL AND g.ended_at <= ?
+          ORDER BY g.ended_at DESC, g.id LIMIT ?`,
+        sport, before, limit,
+      )
+      .map(rowToGame);
+  }
+
   canStartAt(game) {
     return game.scheduledAt - this.#config.startWindowMinutes * 60_000;
   }
@@ -537,7 +626,9 @@ export class GameService {
     const json = {
       id: game.id,
       sport: game.sport,
-      sportName: sport.name,
+      gender: game.gender,
+      level: game.level,
+      sportName: gameLabel(game),
       symbol: sport.symbol,
       status: game.status,
       scheduledAt: game.scheduledAt,
@@ -589,12 +680,12 @@ export class GameService {
          sport = ?, home_name = ?, home_code = ?, home_color = ?, away_name = ?, away_code = ?, away_color = ?,
          location = ?, scheduled_at = ?, status = ?, period = ?, line = ?, outs = ?, note = ?, options = ?,
          clock_ms = ?, clock_anchor = ?, clock_running = ?, scorekeeper_id = ?, started_at = ?, ended_at = ?,
-         scoreboard = ?, scoreboard_manual = ?, updated_at = ?, version = version + 1
+         scoreboard = ?, scoreboard_manual = ?, gender = ?, level = ?, updated_at = ?, version = version + 1
        WHERE id = ?`,
       game.sport, game.home.name, game.home.code, game.home.color, game.away.name, game.away.code, game.away.color,
       game.location, game.scheduledAt, game.status, game.period, JSON.stringify(game.line), game.outs, game.note,
       JSON.stringify(game.options), game.clock.ms, game.clock.anchor, game.clock.running ? 1 : 0, game.scorekeeperId,
-      game.startedAt, game.endedAt, game.scoreboard, game.scoreboardManual ? 1 : 0, now, game.id,
+      game.startedAt, game.endedAt, game.scoreboard, game.scoreboardManual ? 1 : 0, game.gender, game.level, now, game.id,
     );
     return this.getGame(game.id);
   }
@@ -619,6 +710,8 @@ export class GameService {
     const scheduledAt = validateScheduledAt(input.scheduledAt);
     const options = resolveOptions(sport, input.options, defaultOptions(sport));
     const scoreboard = input.scoreboard === undefined ? 'default' : parseScoreboardSetting(input.scoreboard);
+    const gender = input.gender === undefined ? null : validateTeamLabel(input.gender, 'gender', GENDERS);
+    const level = input.level === undefined ? null : validateTeamLabel(input.level, 'level', LEVELS);
     const now = this.#now();
 
     const game = this.#db.transaction(() => {
@@ -628,14 +721,14 @@ export class GameService {
       this.#db.run(
         `INSERT INTO games (id, sport, home_name, home_code, home_color, away_name, away_code, away_color, location,
                             scheduled_at, status, period, line, outs, note, options, clock_ms, clock_anchor, clock_running,
-                            scoreboard, created_by, created_at, updated_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', 0, '[]', 0, '', ?, NULL, NULL, 0, ?, ?, ?, ?, 1)`,
+                            scoreboard, gender, level, created_by, created_at, updated_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', 0, '[]', 0, '', ?, NULL, NULL, 0, ?, ?, ?, ?, ?, ?, 1)`,
         id, sport, home.name, home.code, home.color, away.name, away.code, away.color, location,
-        scheduledAt, JSON.stringify(options), scoreboard, user?.id ?? null, now, now,
+        scheduledAt, JSON.stringify(options), scoreboard, gender, level, user?.id ?? null, now, now,
       );
       return this.getGame(id);
     });
-    this.#log?.info('game created', { gameId: game.id, sport, by: user?.id });
+    this.#log?.info('game created', { gameId: game.id, sport, label: gameLabel(game), by: user?.id });
     this.#emit('changed', null, game);
     return game;
   }
@@ -666,6 +759,10 @@ export class GameService {
         if (changed && locked) throw lockedError();
         next[side] = team;
       }
+      // The label may change in any status; Live Activities already showing
+      // keep the one they started with.
+      if (input.gender !== undefined) next.gender = validateTeamLabel(input.gender, 'gender', GENDERS);
+      if (input.level !== undefined) next.level = validateTeamLabel(input.level, 'level', LEVELS);
       if (input.location !== undefined) next.location = validateLocation(input.location);
       if (input.scheduledAt !== undefined) next.scheduledAt = validateScheduledAt(input.scheduledAt);
       if (input.scoreboard !== undefined) next.scoreboard = parseScoreboardSetting(input.scoreboard);
@@ -771,12 +868,26 @@ export class GameService {
   }
 
   start(id, user) {
+    return this.#start(id, user);
+  }
+
+  // The scoreboard feed starts a scheduled game by itself (§11): the same
+  // start, side effects and push-to-start fan-out, with no user (the claim
+  // stays open for any scorekeeper). `check(game)` re-tests the feed's
+  // conditions inside the transaction. Returns null, changing nothing, when
+  // the game is no longer scheduled or the check fails.
+  autoStart(id, reason, check = () => true) {
+    return this.#start(id, null, { reason, check });
+  }
+
+  #start(id, user, { reason = null, check = null } = {}) {
     const now = this.#now();
     let before;
     const game = this.#db.transaction(() => {
       before = this.#require(id);
+      if (!user && (before.status !== 'scheduled' || (check && !check(before)))) return null;
       if (before.status !== 'scheduled') throw conflict(`This game is already ${before.status}.`);
-      if (user.role !== 'admin') {
+      if (user && user.role !== 'admin') {
         if (before.scorekeeperId !== null && before.scorekeeperId !== user.id) this.#assertHolder(before, user);
         const canStartAt = this.canStartAt(before);
         if (now < canStartAt) {
@@ -784,7 +895,7 @@ export class GameService {
         }
       }
       const next = cloneGame(before);
-      if (next.scorekeeperId === null) next.scorekeeperId = user.id;
+      if (user && next.scorekeeperId === null) next.scorekeeperId = user.id;
       next.status = 'live';
       next.startedAt = now;
       next.endedAt = null;
@@ -793,10 +904,11 @@ export class GameService {
       next.outs = 0;
       next.note = '';
       resetClock(next, now);
-      this.#recordEvent(id, { userId: user.id, type: 'start', now });
+      this.#recordEvent(id, { userId: user?.id ?? null, type: 'start', data: user ? {} : { auto: true, reason }, now });
       return this.#save(next, now);
     });
-    this.#log?.info('game started', { gameId: id, by: user.id });
+    if (!game) return null;
+    this.#log?.info(user ? 'game started' : `game started by the ${reason}`, { gameId: id, label: gameLabel(game), by: user?.id });
     this.#emit('changed', before, game);
     const queued = this.#emit('started', game) ?? 0;
     return { game, queued };
@@ -1007,6 +1119,55 @@ export class GameService {
     return JSON.parse(last.data).manual === false && JSON.parse(previous.data).reason === CONSOLE_RESET_REASON;
   }
 
+  // True when the game was played in its current period, by the event log
+  // (§11 "Final horn"): with `clock`, the game clock ran there; otherwise
+  // points were scored after the period began (not in the same reading).
+  playedInPeriod(id, { clock = false } = {}) {
+    const events = this.#db.all(
+      `SELECT type, data FROM game_events
+        WHERE game_id = ? AND undone = 0 AND type IN ('start', 'period', 'clock', 'score', 'scoreboard', 'undo')
+        ORDER BY id DESC LIMIT 500`,
+      id,
+    );
+    for (const event of events) {
+      const data = JSON.parse(event.data);
+      const reading = event.type === 'scoreboard';
+      const played = clock
+        ? (reading && data.clock?.running) || (event.type === 'clock' && data.op === 'start')
+        : event.type === 'score' || (reading && data.period === undefined && (data.home !== undefined || data.away !== undefined));
+      if (played) return true;
+      // Back to where the period began (an undo may have changed it).
+      if (['start', 'period', 'undo'].includes(event.type) || (reading && data.period !== undefined)) return false;
+    }
+    return false;
+  }
+
+  // True when a person (not the feed) switched this game to scoring by hand:
+  // a game the feed handed over itself (a newer game took its scoreboard, or
+  // the console was reset for another game) has let the scoreboard go.
+  scoreboardManualByPerson(id) {
+    const last = this.#db.get("SELECT user_id FROM game_events WHERE game_id = ? AND type = 'scoreboard_mode' ORDER BY id DESC LIMIT 1", id);
+    return !last || last.user_id !== null;
+  }
+
+  // True when a person last switched this game to the scoreboard (Use the
+  // scoreboard): what it shows is what they want.
+  scoreboardChosenByPerson(id) {
+    const last = this.#db.get("SELECT user_id, data FROM game_events WHERE game_id = ? AND type = 'scoreboard_mode' ORDER BY id DESC LIMIT 1", id);
+    return Boolean(last && last.user_id !== null && JSON.parse(last.data).manual === false);
+  }
+
+  // True when the scoreboard started this game (autoStart), not a person.
+  startedByScoreboard(id) {
+    const start = this.#db.get("SELECT user_id, data FROM game_events WHERE game_id = ? AND type = 'start' ORDER BY id DESC LIMIT 1", id);
+    return Boolean(start && start.user_id === null && JSON.parse(start.data).auto === true);
+  }
+
+  // True once the scoreboard feed has set anything in this game.
+  readByScoreboard(id) {
+    return Boolean(this.#db.get("SELECT 1 AS hit FROM game_events WHERE game_id = ? AND type = 'scoreboard' LIMIT 1", id));
+  }
+
   // The scorekeeper's switch between the scoreboard and scoring by hand.
   setScoreboardManual(id, user, manual) {
     const value = boolean(manual, 'manual');
@@ -1029,22 +1190,27 @@ export class GameService {
     return game;
   }
 
-  end(id, user, { auto = false } = {}) {
+  // `reason` (automatic ends) goes into the event log; `check(game)` re-tests
+  // the caller's conditions inside the transaction: when it fails nothing
+  // changes and null is returned.
+  end(id, user, { auto = false, reason = null, check = null } = {}) {
     const now = this.#now();
     let before;
     const game = this.#db.transaction(() => {
       before = this.#require(id);
       if (before.status !== 'live') throw conflict('This game is not live.');
       if (user) this.#assertHolder(before, user);
+      if (check && !check(before)) return null;
       const next = cloneGame(before);
       stopClock(next, now);
       next.status = 'final';
       next.endedAt = now;
       next.note = '';
-      this.#recordEvent(id, { userId: user?.id ?? null, type: 'end', data: { auto }, now });
+      this.#recordEvent(id, { userId: user?.id ?? null, type: 'end', data: reason ? { auto, reason } : { auto }, now });
       return this.#save(next, now);
     });
-    this.#log?.info(auto ? 'game auto-finalized' : 'game ended', { gameId: id, by: user?.id });
+    if (!game) return null;
+    this.#log?.info(reason ? `game ended automatically: ${reason}` : auto ? 'game auto-finalized' : 'game ended', { gameId: id, by: user?.id });
     this.#emit('changed', before, game);
     this.#emit('ended', game, { canceled: false });
     return game;
