@@ -1428,7 +1428,9 @@ install_app_files() {
 readonly ENV_KEYS=(HOST PORT PUBLIC_URL DATA_DIR TRUST_PROXY SCHOOL_NAME HOME_TEAM_NAME HOME_TEAM_CODE
   HOME_TEAM_COLOR START_WINDOW_MINUTES AUTO_FINAL_HOURS SCHOOL_TIMEZONE APNS_TEAM_ID APNS_KEY_ID APNS_KEY_PATH
   APNS_BUNDLE_ID APNS_ENVIRONMENTS APNS_CHANNEL_STORAGE_POLICY APNS_MIN_UPDATE_INTERVAL_MS
-  SSE_MAX_PER_IP SSE_MAX_CONNECTIONS RATE_LIMIT_PER_MINUTE DEVICE_RATE_LIMIT_PER_MINUTE LOG_LEVEL)
+  SSE_MAX_PER_IP SSE_MAX_CONNECTIONS RATE_LIMIT_PER_MINUTE DEVICE_RATE_LIMIT_PER_MINUTE
+  RADIO_URL RADIO_STATION RADIO_NAME RADIO_STREAM_URL RADIO_POLL_SECONDS RADIO_NOTIFY_GAP_MINUTES
+  FCM_SERVICE_ACCOUNT_PATH FCM_RADIO_TOPIC LOG_LEVEL)
 
 env_default() {
   case $1 in
@@ -1455,6 +1457,12 @@ env_default() {
     SSE_MAX_CONNECTIONS) printf '20000' ;;
     RATE_LIMIT_PER_MINUTE) printf '3000' ;;
     DEVICE_RATE_LIMIT_PER_MINUTE) printf '600' ;;
+    RADIO_URL) printf 'https://radio.marquettenation.com' ;;
+    RADIO_STATION) printf 'marquette_nation_sports' ;;
+    RADIO_NAME) printf 'Marquette Nation Sports' ;;
+    RADIO_POLL_SECONDS) printf '10' ;;
+    RADIO_NOTIFY_GAP_MINUTES) printf '10' ;;
+    FCM_RADIO_TOPIC) printf 'radio' ;;
     LOG_LEVEL) printf 'info' ;;
   esac
 }
@@ -1515,6 +1523,21 @@ $(env_line SSE_MAX_PER_IP)
 $(env_line SSE_MAX_CONNECTIONS)
 $(env_line RATE_LIMIT_PER_MINUTE)
 $(env_line DEVICE_RATE_LIMIT_PER_MINUTE)
+
+# The school's radio station on AzuraCast (ARCHITECTURE.md section 12): while a
+# broadcaster is live, the app shows Listen Live on the game an admin switched
+# "on the radio". RADIO_URL="off" turns it off. RADIO_STREAM_URL defaults to
+# RADIO_URL/listen/RADIO_STATION/radio.mp3.
+$(env_line RADIO_URL)
+$(env_line RADIO_STATION)
+$(env_line RADIO_NAME)
+$(env_line RADIO_STREAM_URL)
+$(env_line RADIO_POLL_SECONDS)
+$(env_line RADIO_NOTIFY_GAP_MINUTES)
+# The "radio is live" notification goes out over Firebase Cloud Messaging with
+# this service account key (README "Radio"); without it, no notification.
+$(env_line FCM_SERVICE_ACCOUNT_PATH)
+$(env_line FCM_RADIO_TOPIC)
 
 # Logging: debug | info | warn | error
 $(env_line LOG_LEVEL)

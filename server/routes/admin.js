@@ -16,7 +16,7 @@ function pushLogView(row) {
   };
 }
 
-export function registerAdminRoutes(router, { config, db, apns, sse, scoreboard }) {
+export function registerAdminRoutes(router, { config, db, apns, sse, scoreboard, radio }) {
   router.get(
     '/api/admin/status',
     () => {
@@ -45,10 +45,17 @@ export function registerAdminRoutes(router, { config, db, apns, sse, scoreboard 
         devices,
         recentPushes: db.all('SELECT * FROM push_log ORDER BY id DESC LIMIT 50').map(pushLogView),
         sseClients: sse.size,
+        radio: radio.adminStatus(),
       };
     },
     { auth: 'admin' },
   );
+
+  // Checks the radio station now instead of waiting for the next check (§12).
+  router.post('/api/admin/radio/check', async () => {
+    await radio.poll();
+    return { radio: radio.adminStatus() };
+  }, { auth: 'admin' });
 
   router.post('/api/admin/apns-check', async () => ({ results: await apns.check(config.apns.channelStoragePolicy) }), { auth: 'admin' });
 

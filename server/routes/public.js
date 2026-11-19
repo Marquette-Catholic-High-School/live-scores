@@ -13,15 +13,19 @@ function deviceToken(value, field) {
   return token;
 }
 
-export function registerPublicRoutes(router, { config, db, games, sse, apns, limiters, now, startedAt }) {
+export function registerPublicRoutes(router, { config, db, games, sse, apns, radio, limiters, now, startedAt }) {
   router.get('/api/config', () => ({
     schoolName: config.schoolName,
     homeTeam: { ...config.homeTeam },
     startWindowMinutes: config.startWindowMinutes,
     timeZone: config.timeZone,
     apnsEnabled: apns.configured,
+    radio: config.radio.enabled ? { name: config.radio.name, playerUrl: config.radio.playerUrl } : null,
     version: config.version,
   }));
+
+  // The radio station's status (§12); null while the radio is turned off.
+  router.get('/api/radio', () => ({ radio: radio.status() }));
 
   router.get('/api/sports', () => ({ sports: allRules() }));
 
@@ -37,7 +41,9 @@ export function registerPublicRoutes(router, { config, db, games, sse, apns, lim
       }
       const before = beforeParam === null ? null : Number(beforeParam);
       const authenticated = Boolean(ctx.user);
-      return { games: games.list(scope, { before }).map((game) => games.serialize(game, { authenticated })) };
+      // The radio's status rides along, so a client polling the board (its
+      // live stream down) still learns when the radio goes live.
+      return { games: games.list(scope, { before }).map((game) => games.serialize(game, { authenticated })), radio: radio.status() };
     },
     { auth: 'optional' },
   );

@@ -23,6 +23,7 @@ export class SseHub {
   #maxTotal;
   #pingIntervalMs;
   #isSessionValid;
+  #helloData = () => ({});
   #closed = false;
 
   // `isSessionValid(sessionId)` re-checks signed-in viewers on every ping, so
@@ -38,6 +39,11 @@ export class SseHub {
 
   get size() {
     return this.#clients.size;
+  }
+
+  // Extra fields for every `hello` event (the radio's status, §12).
+  setHelloData(fn) {
+    this.#helloData = fn;
   }
 
   // Takes over `res`. Throws a 429 HttpError (before any byte is written)
@@ -65,7 +71,13 @@ export class SseHub {
     res.on('close', remove);
     res.on('error', remove);
 
-    this.#write(client, `retry: 3000\n\nevent: hello\ndata: ${eventData({ serverTime: this.#now() })}\n\n`);
+    let extra = {};
+    try {
+      extra = this.#helloData() ?? {};
+    } catch (err) {
+      this.#log?.warn('could not build the hello event', { err: err.message });
+    }
+    this.#write(client, `retry: 3000\n\nevent: hello\ndata: ${eventData({ serverTime: this.#now(), ...extra })}\n\n`);
     this.#ensurePing();
     return client;
   }
@@ -143,6 +155,14 @@ export class SseHub {
       if (client.gameId !== null && client.gameId !== gameId) continue;
       this.#write(client, chunk);
     }
+  }
+
+  // The radio's status changed (§12): sent to every stream, game streams too
+  // (a game's page shows the Listen button).
+  publishRadio(radio) {
+    if (this.#clients.size === 0) return;
+    const chunk = `event: radio\ndata: ${eventData({ serverTime: this.#now(), radio })}\n\n`;
+    for (const client of [...this.#clients]) this.#write(client, chunk);
   }
 
   closeAll() {

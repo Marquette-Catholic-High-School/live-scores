@@ -1,14 +1,16 @@
 // Composition root: wires config, database, services, push, scheduler and the
-// HTTP server. Used by index.js and by the tests (which inject a clock and a
-// fake APNs transport).
+// HTTP server. Used by index.js and by the tests (which inject a clock, a
+// fake APNs transport, and a fake fetch for the radio station and Firebase).
 
 import { ApnsClient } from './apns.js';
 import { AuthService } from './auth.js';
 import { openDatabase } from './db.js';
+import { FcmClient } from './fcm.js';
 import { GameService } from './games.js';
 import { createHttpServer } from './http.js';
 import { createLogger } from './log.js';
 import { PushService } from './push.js';
+import { RadioService } from './radio.js';
 import { RateLimiter } from './ratelimit.js';
 import { buildRouter } from './routes/index.js';
 import { Scheduler } from './scheduler.js';
@@ -28,6 +30,8 @@ export function createApp({
   globalRateLimitPerMinute = config.limits.rateLimitPerMinute,
   deviceRateLimitPerMinute = config.limits.deviceRateLimitPerMinute,
   scoreboardOptions = {},
+  radioOptions = {},
+  fcmOptions = {},
 } = {}) {
   const db = openDatabase(config.dbPath);
   const auth = new AuthService({ db, now, log });
@@ -55,6 +59,11 @@ export function createApp({
   const push = new PushService({ db, apns, config, log: log.child({ component: 'push' }), now, store: games, ...pushOptions });
   const scoreboard = new ScoreboardService({ db, games, config, log: log.child({ component: 'scoreboard' }), now, ...scoreboardOptions });
   games.setScoreboard(scoreboard);
+  // The radio station (§12): its status in every SSE hello, and the "we're
+  // live" notification over Firebase Cloud Messaging.
+  const fcm = new FcmClient({ serviceAccountPath: config.fcm.serviceAccountPath, log: log.child({ component: 'fcm' }), now, ...fcmOptions });
+  const radio = new RadioService({ config, db, games, sse, fcm, log: log.child({ component: 'radio' }), now, ...radioOptions });
+  sse.setHelloData(() => (radio.configured ? { radio: radio.status() } : {}));
   // Feed status changes (connected, unreachable, ...) are part of the game's
   // JSON for signed-in viewers, so they get a new version like any change.
   scoreboard.setStatusListener((gameId) => {
@@ -76,11 +85,14 @@ export function createApp({
       if (feedKey(before) !== feedKey(after)) scoreboard.refresh({ quiet: after.id });
       sse.publishGame(after.id, (authenticated) => games.serialize(after, { authenticated }));
       push.changed(before, after);
+      // Which game the radio carries may have changed (switched on or off the radio, started, ended).
+      if (before?.radio || after.radio) radio.refresh();
     },
     removed: (game) => {
       scoreboard.refresh();
       sse.publishRemoved(game.id);
       push.forget(game);
+      if (game.radio) radio.refresh();
     },
     started: (game) => push.start(game),
     ended: (game, options) => push.end(game, options),
@@ -92,7 +104,7 @@ export function createApp({
     devices: new RateLimiter({ limit: deviceRateLimitPerMinute, windowMs: 60_000, now }),
   };
   const startedAt = now();
-  const router = buildRouter({ config, db, auth, users, apns, sse, games, push, scoreboard, log, now, startedAt, limiters });
+  const router = buildRouter({ config, db, auth, users, apns, sse, games, push, scoreboard, radio, log, now, startedAt, limiters });
   const server = createHttpServer({ config, log, router, auth, now, globalLimiter: limiters.global });
 
   let closing = null;
@@ -108,11 +120,13 @@ export function createApp({
     games,
     push,
     scoreboard,
+    fcm,
+    radio,
     scheduler,
     server,
     limiters,
 
-    async listen({ port = config.port, host = config.host, startScheduler = true, startScoreboard = startScheduler } = {}) {
+    async listen({ port = config.port, host = config.host, startScheduler = true, startScoreboard = startScheduler, startRadio = startScheduler } = {}) {
       await new Promise((resolve, reject) => {
         const onError = (err) => reject(err);
         server.once('error', onError);
@@ -123,6 +137,7 @@ export function createApp({
       });
       if (startScheduler) scheduler.start();
       if (startScoreboard) scoreboard.start();
+      if (startRadio) radio.start();
       return server.address();
     },
 
@@ -132,6 +147,7 @@ export function createApp({
       closing ??= (async () => {
         await scheduler.stop();
         scoreboard.stop();
+        radio.stop();
         sse.closeAll();
         await new Promise((resolve) => {
           if (!server.listening) {
@@ -147,6 +163,7 @@ export function createApp({
           server.closeIdleConnections();
         });
         await push.flush(pushFlushTimeoutMs);
+        await radio.flush(pushFlushTimeoutMs);
         push.close();
         apns.close();
         db.close();

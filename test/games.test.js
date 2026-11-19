@@ -5,7 +5,7 @@ import { act, createGame, gameInput, hexToken, startGame, startTestApp } from '.
 const HOUR = 60 * 60 * 1000;
 const GAME_KEYS = [
   'id', 'sport', 'gender', 'level', 'sportName', 'symbol', 'status', 'scheduledAt', 'location', 'home', 'away', 'period', 'periodLabel',
-  'periodShort', 'isOvertime', 'line', 'outs', 'note', 'clock', 'options', 'rules', 'scorekeeper', 'scoreboard', 'canStartAt',
+  'periodShort', 'isOvertime', 'line', 'outs', 'note', 'clock', 'options', 'rules', 'radio', 'scorekeeper', 'scoreboard', 'canStartAt',
   'startedAt', 'endedAt', 'updatedAt', 'version',
 ];
 

@@ -1800,6 +1800,10 @@ hr { border: 0; border-top: 1px solid var(--border); margin: var(--space-1) 0; }
 .arow__vs { color: var(--text-subtle); font-size: 0.875rem; font-weight: 600; }
 .arow__meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; color: var(--text-muted); font-size: 0.875rem; }
 .arow__feed.is-warn { color: var(--warn); font-weight: 650; }
+.arow__radio { color: var(--ok); font-weight: 650; }
+.arow__radio.is-live { color: var(--live); }
+/* The games list's "Radio" switch (ARCHITECTURE.md §12): pressed = on the radio. */
+.btn--radio[aria-pressed="true"] { --btn-bg: var(--ok-soft); --btn-fg: var(--ok); --btn-border: transparent; }
 .arow__actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; max-width: 360px; }
 
 @media (max-width: 820px) {

@@ -55,6 +55,8 @@ const ACTION_ID_PATTERN = /^[\x21-\x7e]{8,64}$/;
 const SCOPES = ['board', 'all'];
 const ALL_SCOPE_LIMIT = 500;
 const STATUS_ORDER = { live: 0, scheduled: 1, final: 2, canceled: 2 };
+// A game on the radio stays the one it carries this long after it ends (§12).
+export const RADIO_POSTGAME_MS = 60 * 60 * 1000;
 
 const GAME_SELECT = `
   SELECT g.*, u.display_name AS scorekeeper_name
@@ -87,6 +89,7 @@ function rowToGame(row) {
     scorekeeperName: row.scorekeeper_name ?? null,
     scoreboard: row.scoreboard ?? 'default',
     scoreboardManual: row.scoreboard_manual === 1,
+    radio: row.radio === 1,
     channels: { production: row.channel_production, sandbox: row.channel_sandbox },
     startedAt: row.started_at,
     endedAt: row.ended_at,
@@ -619,6 +622,27 @@ export class GameService {
     return game.scheduledAt - this.#config.startWindowMinutes * 60_000;
   }
 
+  // The game the radio carries now (§12), among those switched on the radio:
+  // a live one (the latest started), else one about to start (its start
+  // window is open; the soonest), else one that ended in the last hour (the
+  // postgame show; the latest ended). Null if none.
+  radioGame(now = this.#now()) {
+    const windowMs = this.#config.startWindowMinutes * 60_000;
+    const rows = this.#db.all(
+      `${GAME_SELECT}
+        WHERE g.radio = 1
+          AND (g.status = 'live'
+               OR (g.status = 'scheduled' AND g.scheduled_at BETWEEN ? AND ?)
+               OR (g.status = 'final' AND g.ended_at >= ?))`,
+      now - 12 * HOUR_MS, now + windowMs, now - RADIO_POSTGAME_MS,
+    );
+    const games = rows.map(rowToGame);
+    const pick = (status, key, latest) => games
+      .filter((game) => game.status === status)
+      .sort((a, b) => (latest ? b[key] - a[key] : a[key] - b[key]) || (a.id < b.id ? -1 : 1))[0];
+    return pick('live', 'startedAt', true) ?? pick('scheduled', 'scheduledAt', false) ?? pick('final', 'endedAt', true) ?? null;
+  }
+
   serialize(game, { authenticated = false } = {}) {
     const sport = getSport(game.sport);
     const info = periodInfo(game.sport, game.options, game.period);
@@ -658,6 +682,7 @@ export class GameService {
         bestOf: game.options.bestOf,
       },
       rules: rulesFor(game.sport, game.options),
+      radio: game.radio,
     };
     if (authenticated) {
       json.scorekeeper = game.scorekeeperId === null ? null : { id: game.scorekeeperId, name: game.scorekeeperName };
@@ -680,12 +705,12 @@ export class GameService {
          sport = ?, home_name = ?, home_code = ?, home_color = ?, away_name = ?, away_code = ?, away_color = ?,
          location = ?, scheduled_at = ?, status = ?, period = ?, line = ?, outs = ?, note = ?, options = ?,
          clock_ms = ?, clock_anchor = ?, clock_running = ?, scorekeeper_id = ?, started_at = ?, ended_at = ?,
-         scoreboard = ?, scoreboard_manual = ?, gender = ?, level = ?, updated_at = ?, version = version + 1
+         scoreboard = ?, scoreboard_manual = ?, gender = ?, level = ?, radio = ?, updated_at = ?, version = version + 1
        WHERE id = ?`,
       game.sport, game.home.name, game.home.code, game.home.color, game.away.name, game.away.code, game.away.color,
       game.location, game.scheduledAt, game.status, game.period, JSON.stringify(game.line), game.outs, game.note,
       JSON.stringify(game.options), game.clock.ms, game.clock.anchor, game.clock.running ? 1 : 0, game.scorekeeperId,
-      game.startedAt, game.endedAt, game.scoreboard, game.scoreboardManual ? 1 : 0, game.gender, game.level, now, game.id,
+      game.startedAt, game.endedAt, game.scoreboard, game.scoreboardManual ? 1 : 0, game.gender, game.level, game.radio ? 1 : 0, now, game.id,
     );
     return this.getGame(game.id);
   }
@@ -712,6 +737,7 @@ export class GameService {
     const scoreboard = input.scoreboard === undefined ? 'default' : parseScoreboardSetting(input.scoreboard);
     const gender = input.gender === undefined ? null : validateTeamLabel(input.gender, 'gender', GENDERS);
     const level = input.level === undefined ? null : validateTeamLabel(input.level, 'level', LEVELS);
+    const radio = input.radio === undefined || input.radio === null ? false : boolean(input.radio, 'radio');
     const now = this.#now();
 
     const game = this.#db.transaction(() => {
@@ -721,10 +747,10 @@ export class GameService {
       this.#db.run(
         `INSERT INTO games (id, sport, home_name, home_code, home_color, away_name, away_code, away_color, location,
                             scheduled_at, status, period, line, outs, note, options, clock_ms, clock_anchor, clock_running,
-                            scoreboard, gender, level, created_by, created_at, updated_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', 0, '[]', 0, '', ?, NULL, NULL, 0, ?, ?, ?, ?, ?, ?, 1)`,
+                            scoreboard, gender, level, radio, created_by, created_at, updated_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', 0, '[]', 0, '', ?, NULL, NULL, 0, ?, ?, ?, ?, ?, ?, ?, 1)`,
         id, sport, home.name, home.code, home.color, away.name, away.code, away.color, location,
-        scheduledAt, JSON.stringify(options), scoreboard, gender, level, user?.id ?? null, now, now,
+        scheduledAt, JSON.stringify(options), scoreboard, gender, level, radio ? 1 : 0, user?.id ?? null, now, now,
       );
       return this.getGame(id);
     });
@@ -763,6 +789,8 @@ export class GameService {
       // keep the one they started with.
       if (input.gender !== undefined) next.gender = validateTeamLabel(input.gender, 'gender', GENDERS);
       if (input.level !== undefined) next.level = validateTeamLabel(input.level, 'level', LEVELS);
+      // On the radio (§12): may be switched in any status.
+      if (input.radio !== undefined) next.radio = boolean(input.radio, 'radio');
       if (input.location !== undefined) next.location = validateLocation(input.location);
       if (input.scheduledAt !== undefined) next.scheduledAt = validateScheduledAt(input.scheduledAt);
       if (input.scoreboard !== undefined) next.scoreboard = parseScoreboardSetting(input.scoreboard);

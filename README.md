@@ -107,6 +107,8 @@ that box's address only; re-running the installer keeps it.
 | `api-manage-broadcast.push.apple.com` | **TCP 2196** | Create/read/delete broadcast channels (production) |
 | `api-manage-broadcast.sandbox.push.apple.com` | **TCP 2195** | Create/read/delete broadcast channels (sandbox) |
 | `acme-v02.api.letsencrypt.org` (and `acme.zerossl.com` as fallback) | TCP 443 | HTTPS certificates (automatic renewal) |
+| The radio station (`RADIO_URL`, default `radio.marquettenation.com`) | TCP 443 | Whether the radio is live (8.2) |
+| `oauth2.googleapis.com`, `fcm.googleapis.com` | TCP 443 | The "radio is live" notification (8.2; only with `FCM_SERVICE_ACCOUNT_PATH`) |
 | OS package mirrors: Ubuntu `archive.ubuntu.com`, `security.ubuntu.com` (arm64: `ports.ubuntu.com`); Debian `deb.debian.org`, `security.debian.org`; or your cloud's own mirror (see `/etc/apt/sources.list.d/`) | TCP 80/443 | OS packages and updates |
 | `deb.nodesource.com` | TCP 443 | Node.js (setup script and packages) |
 | `dl.cloudsmith.io` | TCP 443 | Caddy (repository key, list and packages) |
@@ -716,6 +718,47 @@ datagrams reach can read them.
   unless another game on that scoreboard is due to start: then it keeps watching for it.
   While it watches with the console off, it renews the TCP connection every 90 seconds;
   that is no error, and the console keeps saying it is waiting for data.
+
+### 8.2 The radio (Marquette Nation Sports)
+
+The school's radio station runs on its own AzuraCast server
+(<https://radio.marquettenation.com>). This server checks it every 10 seconds; nothing
+needs to change in AzuraCast. Details: ARCHITECTURE.md §12.
+
+* **Put a game on the radio**: in the portal's **Games** tab, press **Radio** on the
+  game (or tick **On Marquette Nation Sports** in its form). Its row then says *Up next
+  on Marquette Nation Sports*, and *On the air* while the station is live.
+* **Go live**: the broadcaster connects to the station with their AzuraCast streamer/DJ
+  account (BUTT, Mixxx or AzuraCast's Web DJ). Within about 10 seconds:
+  * the game's page in the app shows **Listen Live** (from the game's start window until
+    an hour after it ends), and the app's Radio screen and CarPlay list the station;
+  * every iPhone with the app's **Sports Radio** notification on gets *Marquette Nation
+    Sports is live*, naming the game if one is on the radio (tap it to open the game).
+    This happens whenever the station goes live, game or not. A broadcast that drops and
+    comes back within 10 minutes (`RADIO_NOTIFY_GAP_MINUTES`) doesn't notify again.
+* Music the station plays by itself (AutoDJ) doesn't count as live.
+* **System** tab → **Radio** shows whether the station is live, which game it carries,
+  the last check (and why it failed) and the last notification. **Check now** checks
+  immediately.
+
+**One-time setup for the notification** (without it, everything above works except
+the notification):
+
+1. Firebase console → the app's project → **Project settings** → **Service accounts** →
+   **Generate new private key**. Keep the JSON file secret: it can send notifications
+   to every user.
+2. Copy it to the VM and lock it down:
+   ```bash
+   sudo install -o root -g mchslive -m 0640 firebase-service-account.json /etc/mchs-live/firebase-service-account.json
+   ```
+3. In `/etc/mchs-live/mchs-live.env` set
+   `FCM_SERVICE_ACCOUNT_PATH="/etc/mchs-live/firebase-service-account.json"`, then
+   `sudo systemctl restart mchs-live`. System → Radio then says
+   *Firebase project …, topic “radio”*.
+
+If the station's address or short name changes, set `RADIO_URL` / `RADIO_STATION` in
+the same file (`RADIO_URL="off"` turns the radio off). `RADIO_STREAM_URL` is the stream
+the app plays; by default `https://radio.marquettenation.com/listen/marquette_nation_sports/radio.mp3`.
 
 ## 9. Verify APNs
 

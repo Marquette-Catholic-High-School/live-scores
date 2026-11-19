@@ -10,6 +10,9 @@ import { LOG_LEVELS } from './log.js';
 
 export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const APNS_ENVIRONMENT_NAMES = Object.freeze(['production', 'sandbox']);
+export const DEFAULT_RADIO_URL = 'https://radio.marquettenation.com';
+export const DEFAULT_RADIO_STATION = 'marquette_nation_sports';
+export const DEFAULT_RADIO_NAME = 'Marquette Nation Sports';
 
 export class ConfigError extends Error {
   constructor(problems) {
@@ -132,6 +135,35 @@ export function loadConfig(env = process.env, { dotenv = true, publicDir } = {})
   const channelStoragePolicy = integer('APNS_CHANNEL_STORAGE_POLICY', 0, 0, 1);
   const minUpdateIntervalMs = integer('APNS_MIN_UPDATE_INTERVAL_MS', 5000, 0, 60000);
 
+  // The school's AzuraCast radio station (§12). RADIO_URL=off turns it off.
+  const httpUrl = (key, value) => {
+    try {
+      const url = new URL(value);
+      if (url.protocol === 'http:' || url.protocol === 'https:') return true;
+    } catch {
+      // reported below
+    }
+    problems.push(`${key} must be an http(s) URL (got "${value}")`);
+    return false;
+  };
+  const radioUrlRaw = text('RADIO_URL', DEFAULT_RADIO_URL).replace(/\/+$/, '');
+  const radioEnabled = !['off', '0', 'false', 'no', 'none'].includes(radioUrlRaw.toLowerCase());
+  if (radioEnabled) httpUrl('RADIO_URL', radioUrlRaw);
+  const radioStation = text('RADIO_STATION', DEFAULT_RADIO_STATION);
+  if (!/^[A-Za-z0-9_-]{1,100}$/.test(radioStation)) problems.push(`RADIO_STATION must be the station's short name, e.g. ${DEFAULT_RADIO_STATION} (got "${radioStation}")`);
+  const radioName = text('RADIO_NAME', DEFAULT_RADIO_NAME);
+  if (radioName.length > 60) problems.push('RADIO_NAME must be at most 60 characters');
+  const radioStreamUrl = text('RADIO_STREAM_URL', `${radioUrlRaw}/listen/${radioStation}/radio.mp3`);
+  if (radioEnabled) httpUrl('RADIO_STREAM_URL', radioStreamUrl);
+  const radioPollSeconds = integer('RADIO_POLL_SECONDS', 10, 5, 300);
+  const radioNotifyGapMinutes = integer('RADIO_NOTIFY_GAP_MINUTES', 10, 0, 1440);
+
+  // Firebase Cloud Messaging, for the "the radio is live" notification only
+  // (§12): a service account key file. Blank = no notifications.
+  const fcmKeyPathRaw = raw('FCM_SERVICE_ACCOUNT_PATH');
+  const fcmTopic = text('FCM_RADIO_TOPIC', 'radio');
+  if (!/^[A-Za-z0-9_.~%-]{1,900}$/.test(fcmTopic)) problems.push(`FCM_RADIO_TOPIC must be a Firebase topic name: letters, digits and - _ . ~ % (got "${fcmTopic}")`);
+
   const logLevel = text('LOG_LEVEL', 'info').toLowerCase();
   if (!(logLevel in LOG_LEVELS)) problems.push(`LOG_LEVEL must be debug, info, warn or error (got "${logLevel}")`);
 
@@ -160,6 +192,20 @@ export function loadConfig(env = process.env, { dotenv = true, publicDir } = {})
       channelStoragePolicy,
       minUpdateIntervalMs,
       credentialsPresent: Boolean(teamId && keyId && keyPath),
+    }),
+    radio: Object.freeze({
+      enabled: radioEnabled,
+      url: radioEnabled ? radioUrlRaw : null,
+      station: radioStation,
+      name: radioName,
+      streamUrl: radioEnabled ? radioStreamUrl : null,
+      playerUrl: radioEnabled ? `${radioUrlRaw}/public/${radioStation}` : null,
+      pollSeconds: radioPollSeconds,
+      notifyGapMinutes: radioNotifyGapMinutes,
+    }),
+    fcm: Object.freeze({
+      serviceAccountPath: fcmKeyPathRaw ? resolvePath(fcmKeyPathRaw) : undefined,
+      topic: fcmTopic,
     }),
     logLevel,
     version: readPackageVersion(),

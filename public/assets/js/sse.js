@@ -9,6 +9,9 @@
 // (e.g. every fan on the school's Wi-Fi shares one address and the stream
 // limit is reached) `onPoll` is called every POLL_MS instead, so the page
 // keeps refetching the snapshot rather than freezing.
+//
+// `onRadio(radio)` gets the radio station's status (§12): from every `hello`
+// and from each `radio` event (null while the server's radio is turned off).
 
 import { noteServerTime } from './clock.js';
 
@@ -19,7 +22,7 @@ const HIDDEN_RECONNECT_MS = 30_000;
 // The iOS app polls at the same interval when its stream is down.
 const POLL_MS = 15_000;
 
-export function connectStream({ gameId = null, onHello, onGame, onRemoved, onState, onPoll } = {}) {
+export function connectStream({ gameId = null, onHello, onGame, onRemoved, onRadio, onState, onPoll } = {}) {
   const url = gameId === null ? '/api/stream' : `/api/stream?game=${encodeURIComponent(gameId)}`;
   let source = null;
   let state = null;
@@ -60,11 +63,17 @@ export function connectStream({ gameId = null, onHello, onGame, onRemoved, onSta
     source = es;
     es.addEventListener('hello', (event) => {
       if (source !== es) return;
-      parse(event);
+      const data = parse(event);
       failures = 0;
       stopPolling();
       setState('open');
+      onRadio?.(data?.radio ?? null);
       onHello?.();
+    });
+    es.addEventListener('radio', (event) => {
+      if (source !== es) return;
+      const data = parse(event);
+      if (data && 'radio' in data) onRadio?.(data.radio);
     });
     es.addEventListener('game', (event) => {
       if (source !== es) return;

@@ -25,12 +25,18 @@ them drift.
 6. **End game** pushes the final score and the Live Activity dismisses itself
    two hours later. A game the scoreboard drives ends by itself two minutes after the
    final horn (§11). Live games nobody has changed for `AUTO_FINAL_HOURS` are ended automatically.
+7. **The radio** (§12): an admin switches a game **on the radio**. While the school's
+   AzuraCast station has a broadcaster live, the app shows **Listen Live** on that game;
+   when the station goes live, every iPhone subscribed to the radio topic gets a notification.
 
-Firebase is **not** used by any part of this system. The rest of the iOS app
+Firebase is **not** used by any part of this system, with one exception: the "the radio
+is live" notification (§12) is sent through Firebase Cloud Messaging to a topic, because
+that is how the app receives its other announcements. The rest of the iOS app
 (accounts, photographer scheduler, Photo Drop, FCM announcements) stays on
-Firebase and is untouched; the only touch point is the notification settings screen,
+Firebase and is untouched; the touch points are the notification settings screen,
 where the app's own "Live Activities" switch (on by default, separate from the "Sports
-Updates" notifications) opts the device out of game Live Activities.
+Updates" notifications) opts the device out of game Live Activities, and its "Sports Radio"
+switch (the FCM topic §12 sends to).
 
 ## 2. Components
 
@@ -101,6 +107,14 @@ quotes every value it writes.
 | `SSE_MAX_CONNECTIONS` | `20000` | Concurrent `/api/stream` connections in total; the systemd unit's `LimitNOFILE` is kept above it (≥ 65536) |
 | `RATE_LIMIT_PER_MINUTE` | `3000` | `/api/*` requests per client address per minute without a valid session (signed-in staff are not counted) |
 | `DEVICE_RATE_LIMIT_PER_MINUTE` | `600` | `POST /api/devices` requests per client address per minute |
+| `RADIO_URL` | `https://radio.marquettenation.com` | The AzuraCast server (§12); `off` turns the radio off |
+| `RADIO_STATION` | `marquette_nation_sports` | The station's short name in AzuraCast |
+| `RADIO_NAME` | `Marquette Nation Sports` | The station's name as clients show it |
+| `RADIO_STREAM_URL` | `<RADIO_URL>/listen/<RADIO_STATION>/radio.mp3` | The stream clients play |
+| `RADIO_POLL_SECONDS` | `10` | How often the station is checked (5–300) |
+| `RADIO_NOTIFY_GAP_MINUTES` | `10` | A station back on the air within this many minutes of its last broadcast doesn't notify again (0–1440) |
+| `FCM_SERVICE_ACCOUNT_PATH` | — | Path to a Firebase service account key (JSON) for the go-live notification (§12); blank = no notification |
+| `FCM_RADIO_TOPIC` | `radio` | The FCM topic the notification goes to (the app's "Sports Radio" setting) |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
 
 "Client address" = the client IP (behind Caddy or a Cloudflare Tunnel: the last
@@ -164,7 +178,8 @@ games(
   scoreboard TEXT NOT NULL DEFAULT 'default',   -- schema 3, §11: 'default' | 'off' | '<ip>:<port>' | 'udp://<ipv4>:<port>'
   scoreboard_manual INTEGER NOT NULL DEFAULT 0, -- schema 3, §11: 1 = the scorekeeper scores this game by hand
   gender TEXT,                       -- schema 4, §6: 'boys' | 'girls' | NULL (not set)
-  level TEXT                         -- schema 4, §6: 'varsity' | 'jv' | 'freshman' | NULL (not set)
+  level TEXT,                        -- schema 4, §6: 'varsity' | 'jv' | 'freshman' | NULL (not set)
+  radio INTEGER NOT NULL DEFAULT 0   -- schema 5, §12: 1 = an admin switched the game on the radio
 )
 game_events(
   id INTEGER PRIMARY KEY,
@@ -208,12 +223,14 @@ channel_cleanup(                     -- PRIMARY KEY (environment, channel_id)
   delete_after INTEGER NOT NULL      -- when the scheduler may delete the channel at Apple (§8.3)
 )
 -- schema version 3: the scoreboard feed (§11):
-settings(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)  -- 'scoreboard.defaultAddress'
+settings(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)  -- 'scoreboard.defaultAddress';
+                                                    -- §12: 'radio.lastLiveAt', 'radio.lastNotifiedAt' (unix ms)
 ```
 
-The schema version is `PRAGMA user_version` (currently **4**). Migrations run at startup,
+The schema version is `PRAGMA user_version` (currently **5**). Migrations run at startup,
 each in one transaction; migration 2 also queues the channels of games that had already
-ended for deletion; migration 4 adds `gender` and `level` (NULL for existing games). A database with a newer version than the server knows is refused
+ended for deletion; migration 4 adds `gender` and `level` (NULL for existing games);
+migration 5 adds `radio` (0 for existing games) and the partial index `games_radio`. A database with a newer version than the server knows is refused
 (an older server can't open a database a newer one has migrated).
 
 Keep only the last 30 days of `push_log`; delete sessions after expiry; devices
@@ -329,6 +346,7 @@ length, **stopped**. A period with 0 minutes has no clock (`clock_ms = NULL`).
   "clock": { "running": true, "remainingMs": 312000, "anchorAt": 1793571000000, "periodMs": 480000 },  // or null
   "options": { "clockEnabled": true, "periodMinutes": 8, "overtimeMinutes": 4, "bestOf": null },
   "rules": { /* the SPORTS entry for this sport (incl. overtime.naming), with volleyball periods expanded for this game's bestOf */ },
+  "radio": true,                          // §12: an admin switched it on the radio (Listen Live shows only while the station is live and carries it)
   "scorekeeper": { "id": 3, "name": "Coach Smith" },   // null if unclaimed; only included for authenticated viewers, otherwise omitted
   "scoreboard": { "setting": "default", "custom": null, "address": "10.20.1.50:10001", "eligible": true, "manual": false,
                   "controlling": true, "state": "receiving", "message": "Score, clock and period come from the scoreboard.",
@@ -388,9 +406,10 @@ Codes used: `bad_request` 400, `unauthorized` 401, `forbidden` 403, `not_found` 
 * Passwords: `crypto.scrypt` (N=16384, r=8, p=1, 64-byte key, 16-byte random salt), constant-time compare. Minimum 8 characters.
 
 ### Public (no auth)
-* `GET /api/config` → `{ schoolName, homeTeam: { name, code, color }, startWindowMinutes, timeZone, apnsEnabled, version }`
+* `GET /api/config` → `{ schoolName, homeTeam: { name, code, color }, startWindowMinutes, timeZone, apnsEnabled, radio: { name, playerUrl } | null, version }` (`radio` null while `RADIO_URL=off`)
+* `GET /api/radio` → `{ radio: Radio | null }` (§12)
 * `GET /api/sports` → `{ sports: { <id>: <SPORTS entry + "id"> } }`
-* `GET /api/games?scope=board|all[&before=<unix ms>]` → `{ games: [Game] }`
+* `GET /api/games?scope=board|all[&before=<unix ms>]` → `{ games: [Game], radio: Radio | null }` (§12: a client polling the board still sees the radio go live)
   * `board` (default): every `live` game, `scheduled` games with `scheduledAt` from 12 h ago to 14 days ahead, and `final`/`canceled` games that ended (or were scheduled) in the last 3 days. Sorted: live (by startedAt), then scheduled (scheduledAt asc), then final (endedAt desc).
   * `all` (auth required: any role, else 401): at most 500 games — the live ones first, then
     those scheduled nearest to now (before or after), so a season scheduled ahead never
@@ -442,7 +461,8 @@ Codes used: `bad_request` 400, `unauthorized` 401, `forbidden` 403, `not_found` 
 * `POST /api/games/:id/scoreboard` `{ manual: boolean }` → `{ game }` — holder or admin, `scheduled` or `live`: score this game by hand (the scoreboard feed pauses for it; before the start it also keeps the game from starting by itself, and live it keeps it from ending at the final horn) or let the scoreboard drive it again (§11).
 
 ### Admin (role `admin`)
-* `POST /api/games` `{ sport, gender?, level?, home:{name,code,color}, away:{name,code,color}, location, scheduledAt, options:{ clockEnabled?, periodMinutes?, overtimeMinutes?, bestOf? }, scoreboard? }` → `{ game }`
+* `POST /api/games` `{ sport, gender?, level?, home:{name,code,color}, away:{name,code,color}, location, scheduledAt, options:{ clockEnabled?, periodMinutes?, overtimeMinutes?, bestOf? }, scoreboard?, radio? }` → `{ game }`
+  * `radio`: `true` / `false` (default `false`; anything else → 400): on the radio (§12). `PATCH` may change it in any status.
   * `gender`: `"boys"`, `"girls"` or `null`; `level`: `"varsity"`, `"jv"`, `"freshman"` or `null` (exact lowercase values; omitted or `null` = not set; anything else → 400 `gender must be "boys", "girls" or null.` / `level must be "varsity", "jv", "freshman" or null.`). They make the game's label (§6).
   * `scoreboard` (§11): `"default"` (the default), `"off"`, or the address of another scoreboard box (§11 "Addresses"): over TCP `"10.20.1.51"`, `"10.20.1.51:3001"` or `"tcp://10.20.1.51"` (IPv4/IPv6 literals only; port 10001 if omitted; the Lantronix box's own ports → 400), over UDP `"udp://10.20.1.51"` or `"udp://10.20.1.51:21001"` (IPv4 only; port 21000 if omitted, 1024–65535). Stored and returned in canonical form; 400 otherwise.
   * Validation: sport known; `home` optional (default: the `HOME_TEAM_*` team), `away` required; names 1–40 chars; codes 2–4 chars `[A-Z0-9]` (uppercased); colors `#RRGGBB`; `location` ≤ 100 chars; scheduledAt a number of ms (2000–2100); `periodMinutes` 1–60; `overtimeMinutes` 0–30; `bestOf` 3|5. Options that don't apply to the sport are validated but ignored. Missing options take the sport defaults.
@@ -453,7 +473,8 @@ Codes used: `bad_request` 400, `unauthorized` 401, `forbidden` 403, `not_found` 
 * `POST /api/users` `{ username, displayName, password, role }` → `{ user }` (409 if username taken)
 * `PATCH /api/users/:id` `{ displayName?, role?, disabled?, password? }` → `{ user }` — setting a password or disabling revokes that user's sessions. An admin can't demote/disable/delete themself, and the last enabled admin can't be removed (409).
 * `DELETE /api/users/:id` → `{ ok: true }`
-* `GET /api/admin/status` → `{ apns: { configured, environments, teamId, keyId, bundleId, error? }, devices: { production: { enabled, total, invalid }, sandbox: {…} }, recentPushes: [push_log rows, newest 50], sseClients }` (`error` only while APNs isn't configured)
+* `GET /api/admin/status` → `{ apns: { configured, environments, teamId, keyId, bundleId, error? }, devices: { production: { enabled, total, invalid }, sandbox: {…} }, recentPushes: [push_log rows, newest 50], sseClients, radio }` (`error` only while APNs isn't configured; `radio` §12)
+* `POST /api/admin/radio/check` → `{ radio }` — checks the station now (§12) and returns what `admin/status` would
 * `POST /api/admin/apns-check` → `{ results: { <env>: { ok, channelId?, error? } } }` — creates a test broadcast channel in each environment, reads it back, then deletes it. Verifies the key, team, bundle and broadcast capability end to end.
 * `GET /api/admin/scoreboard` → `{ defaultAddress: "<ip>:<port>" | "udp://<ipv4>:<port>" | null, feeds: [{ address, gameId, watching, state, error, lastReadingAt }] }` (§11) — one feed per scoreboard a live game reads (`watching: false`), and one per scoreboard watched for a scheduled game to start (`watching: true`, `gameId` = that game)
 * `PATCH /api/admin/scoreboard` `{ defaultAddress: "[tcp://]<ip>[:port]" | "udp://<ipv4>[:port]" | null | "" }` → same (400 on an invalid address, with the reason; `null`/`""` clears it)
@@ -482,8 +503,13 @@ data: {"serverTime":1793571001234,"game":{…Game…}}
 event: removed
 data: {"serverTime":…,"id":"k3j9x2m4pq"}
 
+event: radio
+data: {"serverTime":…,"radio":{…Radio…}}
+
 : ping
 ```
+* `hello` also carries `"radio": {…Radio…}` while the radio is on (§12; no `radio` key while `RADIO_URL=off`).
+* `radio` is sent to **every** stream (`?game=` ones too) whenever the radio's status changes (§12).
 * `game` is sent whenever any game changes (create/edit/claim/start/action/end/cancel).
   With `?game=:id` only that game's events are sent (404 before streaming if the game doesn't exist).
 * A stream opened with a valid session (cookie or bearer) gets the signed-in Game JSON
@@ -683,6 +709,11 @@ the devices it hasn't reached), not the ones already on Lock Screens.
   stale state; compact/minimal/expanded Dynamic Island.
 * On launch / foreground the app ends any of its Live Activities whose game is
   final, canceled or deleted on the server.
+* **Radio** (§12): the store keeps the `Radio` status (board, `hello`, `radio` events).
+  Game detail shows **Listen Live** while `radio.live` and `radio.gameId` is that game;
+  the Radio screen and CarPlay's Radio tab list the station while it is live. The
+  "Sports Radio" notification setting is the FCM topic `radio`; tapping the notification
+  opens its `url` (`mchs://game/<id>` or `mchs://radio`).
 
 ## 10. Security notes
 
@@ -1005,3 +1036,53 @@ If a feed already uses that exact address, the result describes that feed (`inUs
 `gameId` then being that game; over UDP `otherSources` is then empty). A UDP test on a port a feed for a
 **different** box already has bound shares that socket: it never binds twice and never
 disturbs the feed.
+
+## 12. Radio (AzuraCast)
+
+The school's radio station runs on its own [AzuraCast](https://www.azuracast.com) server.
+This server only reads it: there is nothing to set up in AzuraCast besides the station
+itself and a streamer/DJ account for each broadcaster.
+
+* **Live** = a broadcaster is connected. Every `RADIO_POLL_SECONDS` the server reads
+  `GET <RADIO_URL>/api/nowplaying/<RADIO_STATION>` (public, no key) and takes
+  `live.is_live`; music the station's AutoDJ plays doesn't count. A check that fails
+  (unreachable, timeout, non-200, not JSON) keeps the last status; after three in a row the
+  station counts as off the air. A 404 usually means the station isn't started in AzuraCast.
+* **The game on the radio** (`gameId`): among games with `radio = 1`, a live one (the latest
+  started), else a scheduled one whose start window is open (`now ≥ canStartAt`, scheduled
+  at most 12 h ago; the soonest), else a final one that ended in the last hour (the postgame
+  show; the latest ended). Canceled games never count. It doesn't depend on whether the
+  station is live.
+* **Radio JSON** (`GET /api/radio`, the board, SSE `hello` and `radio`):
+  ```jsonc
+  { "live": true, "name": "Marquette Nation Sports",
+    "streamUrl": "https://radio.marquettenation.com/listen/marquette_nation_sports/radio.mp3",
+    "playerUrl": "https://radio.marquettenation.com/public/marquette_nation_sports",
+    "since": 1795108893000,      // unix ms the broadcast started, null while off the air
+    "gameId": "k3j9x2m4pq" }     // the game on the radio, or null
+  ```
+  Clients show **Listen Live** on a game only while `live` and `gameId` is that game. The
+  SSE `radio` event goes out whenever this JSON changes: after a check, and after any change
+  to a game that is (or was) on the radio. `admin/status` adds `configured`, `url`,
+  `station`, `streamer` (while live), `checkedAt`, `error` and `notifications:
+  { configured, projectId, error?, topic, gapMinutes, lastSentAt, last: { at, ok, detail } }`.
+* **The notification.** When the station goes live and its last broadcast was
+  `RADIO_NOTIFY_GAP_MINUTES` or more ago (`settings` `radio.lastLiveAt`, updated at every
+  check while live, so a dropped connection that comes back, or a server restart
+  mid-broadcast, doesn't notify twice), one FCM HTTP v1 message goes to the topic
+  `FCM_RADIO_TOPIC`, whether or not a game is on the radio:
+  ```jsonc
+  { "topic": "radio",
+    "notification": { "title": "Marquette Nation Sports is live",
+                      "body": "Girls Varsity Basketball: Marquette vs Alton. Tap to listen." },  // no game: "Tap to listen live."
+    "data": { "kind": "radio", "url": "mchs://game/<id>" },                               // no game: "mchs://radio"
+    "apns": { "headers": { "apns-priority": "10", "apns-collapse-id": "radio-live" },
+              "payload": { "aps": { "sound": "default" } } } }
+  ```
+  Auth (`server/fcm.js`): an RS256 JWT signed with the service account's key
+  (`iss` = `client_email`, `scope` = `https://www.googleapis.com/auth/firebase.messaging`,
+  `aud` = `token_uri`, 1 h) traded at `token_uri` for an access token, cached until 5 minutes
+  before it expires; a 401/403 renews it once; network errors, 429 and 5xx are retried twice
+  (2 s, 10 s). Each notification is a `push_log` row (`kind` `radio`, no environment).
+  Without `FCM_SERVICE_ACCOUNT_PATH` the radio works and the row says why nothing was sent.
+

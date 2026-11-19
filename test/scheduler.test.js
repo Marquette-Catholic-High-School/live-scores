@@ -121,7 +121,8 @@ describe('scheduler', () => {
     const endedAt = local.clock.now() - HOUR;
     db.exec(`DROP TABLE push_progress; DROP TABLE pending_ends; DROP TABLE channel_cleanup; DROP TABLE settings;
              ALTER TABLE games DROP COLUMN scoreboard; ALTER TABLE games DROP COLUMN scoreboard_manual;
-             ALTER TABLE games DROP COLUMN gender; ALTER TABLE games DROP COLUMN level; PRAGMA user_version = 1`);
+             ALTER TABLE games DROP COLUMN gender; ALTER TABLE games DROP COLUMN level;
+             DROP INDEX games_radio; ALTER TABLE games DROP COLUMN radio; PRAGMA user_version = 1`);
     db.run(
       `INSERT INTO games (id, sport, home_name, home_code, home_color, away_name, away_code, away_color, scheduled_at, status,
                           channel_production, channel_sandbox, ended_at, created_at, updated_at)
@@ -131,10 +132,11 @@ describe('scheduler', () => {
     db.close();
     const upgraded = await startTestApp({ dir, clock: local.clock });
     try {
-      assert.equal(upgraded.app.db.schemaVersion, 4);
+      assert.equal(upgraded.app.db.schemaVersion, 5);
       const legacy = upgraded.app.games.getGame('legacygame');
       assert.equal(legacy.scoreboard, 'default', 'existing games use the default scoreboard');
       assert.deepEqual([legacy.gender, legacy.level], [null, null], 'existing games have no team label');
+      assert.equal(legacy.radio, false, 'existing games are not on the radio');
       assert.equal(upgraded.app.games.serialize(legacy).sportName, 'Soccer');
       await upgraded.app.scheduler.tick();
       assert.equal(upgraded.transport.byKind('channel-delete').length, 0, 'kept until 6 h after the end');

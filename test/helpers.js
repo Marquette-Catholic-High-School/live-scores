@@ -222,6 +222,9 @@ export async function startTestApp({ env = {}, apns = true, publicFiles = null, 
       PORT: '0',
       LOG_LEVEL: 'silent',
       APNS_MIN_UPDATE_INTERVAL_MS: '0',
+      // The radio (§12) is on by default, pointed at the school's station;
+      // tests turn it on with a fake station (test/radio.test.js).
+      RADIO_URL: 'off',
       ...(apns ? { APNS_TEAM_ID: TEAM_ID, APNS_KEY_ID: KEY_ID, APNS_KEY_PATH: keyPath } : {}),
       ...env,
     },

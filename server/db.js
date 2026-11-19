@@ -159,6 +159,12 @@ const MIGRATIONS = [
   ALTER TABLE games ADD COLUMN gender TEXT;
   ALTER TABLE games ADD COLUMN level TEXT;
   `,
+  // 5: the admin's "on the radio" switch (§12): 1 = the school's radio
+  // station carries this game, so fans can listen from it while it's live.
+  `
+  ALTER TABLE games ADD COLUMN radio INTEGER NOT NULL DEFAULT 0;
+  CREATE INDEX games_radio ON games(status) WHERE radio = 1;
+  `,
 ];
 
 export class Database {

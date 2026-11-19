@@ -53,7 +53,16 @@ let sports = {};
 // GET /api/admin/scoreboard: the default scoreboard address (for the game
 // form) and the live feeds (System tab).
 let scoreboardSettings = null;
+// The radio station's status (ARCHITECTURE.md §12), from the live stream and
+// every games snapshot: null while the server's radio is turned off.
+let radioStatus = null;
 const store = new GameStore();
+
+function setRadioStatus(radio) {
+  const changed = JSON.stringify(radio ?? null) !== JSON.stringify(radioStatus);
+  radioStatus = radio ?? null;
+  if (changed) gamesPanel?.radioChanged();
+}
 
 async function loadScoreboardSettings() {
   scoreboardSettings = await api('/api/admin/scoreboard');
@@ -455,6 +464,20 @@ function gameFormDialog(game = null) {
       date.addEventListener('input', syncTimeHint);
       time.addEventListener('input', syncTimeHint);
 
+      // On the radio (§12): fans get a Listen Live button on this game in the
+      // app while the station is live. Hidden while the server's radio is off.
+      const radioOn = el('input', { type: 'checkbox', class: 'checkbox__input' });
+      radioOn.checked = Boolean(game?.radio);
+      const radioSet = config.radio
+        ? el(
+          'fieldset',
+          { class: 'fieldset' },
+          el('legend', { text: 'Radio' }),
+          el('label', { class: 'checkbox' }, radioOn, el('span', { text: `On ${config.radio.name}` })),
+          el('p', { class: 'field__hint', text: `While ${config.radio.name} is live, the app shows a Listen Live button on this game (from its start window until an hour after it ends).` }),
+        )
+        : null;
+
       const error = el('p', { class: 'form-error', role: 'alert', hidden: true });
       const formId = uniqueId('game-form');
       const form = el(
@@ -471,6 +494,7 @@ function gameFormDialog(game = null) {
         clockSet,
         setsSet,
         feedSet,
+        radioSet,
         error,
       );
       const submit = el('button', { type: 'submit', class: 'btn btn--primary btn--lg', text: editing ? 'Save changes' : 'Create game', form: formId });
@@ -507,6 +531,7 @@ function gameFormDialog(game = null) {
         }
         if (rules.scoreMode === 'sets') payload.options.bestOf = Number(bestOf.value);
         if (!feedSet.hidden && (!editing || feedValue() !== shownFeed)) payload.scoreboard = feedValue();
+        if (radioSet && (!editing || radioOn.checked !== Boolean(game.radio))) payload.radio = radioOn.checked;
 
         setBusy(submit, true);
         try {
@@ -627,6 +652,12 @@ class GamesPanel {
     this.status.replaceChildren(this.error ? errorNotice(`Couldn’t load the games: ${this.error.message}`, { retry: () => resyncGames() }) : '');
   }
 
+  // The station went live or off the air, or carries another game: redraw the rows.
+  radioChanged() {
+    this.rowGames.clear();
+    this.render();
+  }
+
   fillRow(row, game) {
     const started = hasStarted(game);
     const open = game.status === 'scheduled' || game.status === 'live';
@@ -642,10 +673,26 @@ class GamesPanel {
     const warn = state === 'unreachable' || state === 'waiting';
     const feedState = !feed ? undefined : auto ? ['starts automatically', warn && feedStateLabel(state, feed.address)].filter(Boolean).join(' · ') : feedStateLabel(feed.state, feed.address);
 
+    // The radio switch (§12). "On the air" when the station is live and
+    // carries this game; "next on the radio" when it carries it but isn't live yet.
+    const onRadio = Boolean(config.radio && game.radio);
+    const carried = onRadio && radioStatus?.gameId === game.id;
+    const radioText = !onRadio ? null : carried && radioStatus.live ? `On the air on ${config.radio.name}` : carried ? `Up next on ${config.radio.name}` : `On ${config.radio.name}`;
+
     const actions = [
       el('button', { type: 'button', class: 'btn btn--sm', text: 'Edit', on: { click: () => gameFormDialog(game) } }),
       el('a', { class: 'btn btn--sm', href: `/keeper?game=${encodeURIComponent(game.id)}`, text: game.status === 'live' ? 'Score' : 'Console' }),
     ];
+    if (config.radio && (game.status !== 'canceled' || game.radio)) {
+      actions.push(el('button', {
+        type: 'button',
+        class: 'btn btn--sm btn--radio',
+        text: 'Radio',
+        'aria-pressed': String(game.radio),
+        title: game.radio ? `On ${config.radio.name}: click to take it off` : `Put this game on ${config.radio.name}`,
+        on: { click: (event) => this.setRadio(event.currentTarget, game, !game.radio) },
+      }));
+    }
     if (open && !holder) {
       actions.push(el('button', { type: 'button', class: 'btn btn--sm', text: 'Claim', on: { click: (event) => this.claim(event.currentTarget, game, false) } }));
     } else if (open && !mine) {
@@ -679,6 +726,7 @@ class GamesPanel {
           game.location ? el('span', { text: game.location }) : null,
           el('span', { class: 'arow__holder', text: holder ? `Scorekeeper: ${mine ? 'you' : holder.name}` : open ? 'Unclaimed' : 'No scorekeeper' }),
           feedState ? el('span', { class: ['arow__feed', warn && 'is-warn'], title: feed.message, text: `Scoreboard: ${feedState}` }) : null,
+          radioText ? el('span', { class: ['arow__radio', carried && radioStatus.live && 'is-live'], text: radioText }) : null,
         ),
       ),
       el('div', { class: 'arow__actions' }, actions),
@@ -723,6 +771,19 @@ class GamesPanel {
 
   release(button, game) {
     return this.post(button, game, '/release', {}, 'Released. Any scorekeeper can claim it now.');
+  }
+
+  async setRadio(button, game, radio) {
+    setBusy(button, true);
+    try {
+      const result = await api(gameApiPath(game.id), { method: 'PATCH', body: { radio } });
+      store.upsert(result.game);
+      toast(radio ? `${matchup(game)} is on ${config.radio.name}. The app shows Listen Live on it while the station is live.` : `${matchup(game)} is off the radio.`, { tone: 'success' });
+    } catch (err) {
+      handleError(err);
+    } finally {
+      if (button.isConnected) setBusy(button, false);
+    }
   }
 
   async cancel(button, game) {
@@ -1045,7 +1106,7 @@ class UsersPanel {
 
 const ENVIRONMENT_NAMES = { production: 'Production', sandbox: 'Sandbox' };
 const ENVIRONMENT_HINTS = { production: 'App Store and TestFlight', sandbox: 'Builds run from Xcode' };
-const PUSH_KINDS = { start: 'Start', update: 'Update', end: 'End', channel: 'Channel' };
+const PUSH_KINDS = { start: 'Start', update: 'Update', end: 'End', channel: 'Channel', radio: 'Radio live' };
 const SYSTEM_REFRESH_MS = 30_000;
 
 function keyValues(pairs) {
@@ -1427,6 +1488,58 @@ class SystemPanel {
     }
   }
 
+  // The radio station (ARCHITECTURE.md §12): whether it's live, the game it
+  // carries, and the "we're live" notification's setup.
+  radioCard(radio) {
+    const card = el('section', { class: 'card' });
+    const fill = (status) => {
+      const notifications = status.notifications;
+      const head = (badge, tone) => el('div', { class: 'card__head' }, el('h3', { class: 'card__title', text: 'Radio' }), el('span', { class: ['badge', tone], text: badge }));
+      if (!status.configured) {
+        card.replaceChildren(head('Off', 'badge--canceled'), el('p', { class: 'card__text', text: 'The radio is turned off on this server (RADIO_URL=off).' }));
+        return;
+      }
+      const game = status.gameId ? store.get(status.gameId) : null;
+      const [badge, tone] = status.error && !status.live ? ['Can’t reach the station', 'badge--canceled'] : status.live ? ['Live', 'badge--live'] : ['Off the air', 'badge--final'];
+      const last = notifications.last;
+      const checkButton = el('button', {
+        type: 'button',
+        class: 'btn',
+        text: 'Check now',
+        on: {
+          click: async (event) => {
+            const button = event.currentTarget;
+            setBusy(button, true);
+            try {
+              fill((await api('/api/admin/radio/check', { method: 'POST' })).radio);
+            } catch (err) {
+              handleError(err);
+              if (button.isConnected) setBusy(button, false);
+            }
+          },
+        },
+      });
+      card.replaceChildren(
+        head(badge, tone),
+        el('p', { class: 'card__text', text: `While a broadcaster is connected to ${status.name}, the app shows Listen Live on the game switched on the radio (Games tab, “Radio”), and iPhones with the MCHS app get a notification when it goes live.` }),
+        status.error ? el('p', { class: 'notice notice--warn', text: `Last check failed: ${status.error}` }) : null,
+        notifications.configured ? null : el('p', { class: 'notice notice--warn', text: `No go-live notifications: ${String(notifications.error ?? 'Firebase isn’t set up').replace(/\.$/, '')}. See the README, “Radio”.` }),
+        keyValues([
+          ['Station', el('a', { href: status.playerUrl, target: '_blank', rel: 'noopener', text: status.name })],
+          ['Stream', el('span', { class: 'mono wrap', text: status.streamUrl })],
+          ['On the radio', game ? matchup(game) : status.gameId ? status.gameId : 'No game right now'],
+          status.live ? ['Broadcaster', status.streamer ?? '—'] : null,
+          ['Last checked', status.checkedAt ? formatTimestamp(status.checkedAt) : 'Not yet'],
+          ['Notifications', notifications.configured ? `Firebase project ${notifications.projectId}, topic “${notifications.topic}”` : 'Not set up'],
+          last ? ['Last notification', `${formatTimestamp(last.at)}: ${last.ok ? 'sent' : last.detail}`] : null,
+        ]),
+        el('div', { class: 'card__actions' }, checkButton, el('span', { class: 'field__hint', text: `Checked by itself every few seconds. A broadcast that drops and comes back within ${notifications.gapMinutes} minutes doesn’t notify again.` })),
+      );
+    };
+    fill(radio);
+    return card;
+  }
+
   render(status) {
     const { apns, devices, recentPushes, sseClients } = status;
     const checkButton = el('button', { type: 'button', class: 'btn btn--primary', text: 'Check APNs', on: { click: (event) => this.check(event.currentTarget) } });
@@ -1500,7 +1613,7 @@ class SystemPanel {
       ))
       : emptyState('No pushes yet', 'Pushes appear here once a game starts.');
 
-    this.content.replaceChildren(stats, el('div', { class: 'card-grid' }, apnsCard, devicesCard));
+    this.content.replaceChildren(stats, el('div', { class: 'card-grid' }, apnsCard, devicesCard, this.radioCard(status.radio)));
     // The scoreboard card sits between these, untouched by the refresh.
     this.pushes.replaceChildren(el('h3', { class: 'card__title', text: 'Recent pushes' }), pushTable);
     this.pushes.hidden = false;
@@ -1555,7 +1668,8 @@ const resyncGames = coalesce(async () => {
   clearTimeout(resyncTimer);
   const requestedAt = Date.now();
   try {
-    const { games } = await api('/api/games?scope=all');
+    const { games, radio } = await api('/api/games?scope=all');
+    setRadioStatus(radio);
     // A full snapshot holds only the games nearest to now (and every live
     // one, however old): older pages and games beyond its span stay.
     const full = games.length >= ALL_SCOPE_LIMIT;
@@ -1664,6 +1778,7 @@ async function main() {
     onPoll: () => resyncGames(),
     onGame: onStreamGame,
     onRemoved: (id) => store.remove(id),
+    onRadio: setRadioStatus,
     onState: (state) => renderConnection(dom.conn, state),
   });
   resyncGames();
