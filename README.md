@@ -6,10 +6,12 @@ shows them instantly on the public scoreboard and in the app, and puts a **Live
 Activity** on the Lock Screen and Dynamic Island of every iPhone with the app (unless its
 owner turned **Live Activities** off in the app). Home basketball and volleyball games
 can run on their own from the gym's scoreboard: they start at their time once the
-scoreboard is on, and end at the final horn. It runs on one small Linux VM with no Firebase and no other
-cloud services: one Node.js process, an SQLite database file, and Caddy for HTTPS
-(or, if you prefer no open ports, a [Cloudflare Tunnel](#53-cloudflare-tunnel-instead-of-open-ports)).
-Apple's push service (APNs) does the heavy lifting of delivering updates to phones.
+scoreboard is on, and end at the final horn. It runs on one small Linux VM: one Node.js
+process, an SQLite database file, and Caddy for HTTPS (or, if you prefer no open ports,
+a [Cloudflare Tunnel](#53-cloudflare-tunnel-instead-of-open-ports)). Apple's push service
+(APNs) does the heavy lifting of delivering updates to phones. The only other cloud
+service is Firebase, and only for the optional "the radio is live" notification
+([section 8.2](#82-the-radio-marquette-nation-sports)); everything else works without it.
 
 ```
                  ┌──────────────────────── your VM ────────────────────────┐
@@ -814,9 +816,10 @@ Things to know:
   with their defaults, e.g. `SCHOOL_TIMEZONE` (`America/Chicago`, or what you enter at
   the prompt / pass with `--school-timezone`) and the capacity keys. Its output line
   `Updated /etc/mchs-live/mchs-live.env: …` lists what changed.
-* The server updates the database schema by itself when it starts (now version 4:
+* The server updates the database schema by itself when it starts (now version 5:
   version 2 added the tables that let pushes survive a restart, version 3 the scoreboard
-  settings of section 8.1, version 4 a game's Boys/Girls and level). An older server refuses a database
+  settings of section 8.1, version 4 a game's Boys/Girls and level, version 5 a game's
+  radio switch of section 8.2). An older server refuses a database
   a newer one has updated ("schema version … is newer than this server"): to go back to
   an older version, re-run its installer (it stops because the server doesn't start),
   then `sudo mchs-live-restore` the `-pre-upgrade` backup taken before the upgrade
