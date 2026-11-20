@@ -19,6 +19,24 @@ import {
   volleyballBestOfValues,
 } from './sports.js';
 import { boolean, integer, oneOf, requireObject, string } from './validate.js';
+import {
+  activityBox,
+  applyBoardBox,
+  applyFoul,
+  applyRoster,
+  applyTimeout,
+  boardReleased,
+  boxPeriodStep,
+  clockStarted,
+  creditPoints,
+  parseBox,
+  parseRoster,
+  requireBox,
+  serializeBox,
+  startBox,
+  timeoutLabel,
+  timeoutsOptionChanged,
+} from './box.js';
 
 const ID_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
 const ID_LENGTH = 10;
@@ -34,11 +52,15 @@ const LOCATION_MAX_LENGTH = 100;
 const MIN_SCHEDULED_AT = Date.UTC(2000, 0, 1);
 const MAX_SCHEDULED_AT = Date.UTC(2100, 0, 1);
 
-export const UNDOABLE_TYPES = Object.freeze(['score', 'set_score', 'period', 'clock', 'outs', 'note']);
-export const ACTION_TYPES = Object.freeze([...UNDOABLE_TYPES, 'undo']);
+export const UNDOABLE_TYPES = Object.freeze(['score', 'set_score', 'period', 'clock', 'outs', 'note', 'player_points', 'foul', 'timeout']);
+// `roster` (§13) edits who plays, not the game: never undone, and allowed
+// before the game too.
+export const ACTION_TYPES = Object.freeze([...UNDOABLE_TYPES, 'undo', 'roster']);
+const PREGAME_TYPES = Object.freeze(['roster']);
 // What the scoreboard feed sets (§11); the scorekeeper can't change these by
-// hand while it drives the game. Notes stay manual.
-const SCOREBOARD_TYPES = Object.freeze(['score', 'set_score', 'period', 'clock', 'undo']);
+// hand while it drives the game. Notes stay manual, and so do the players'
+// points and fouls (§13: the feed keeps only the team fouls, see `foul`).
+const SCOREBOARD_TYPES = Object.freeze(['score', 'set_score', 'period', 'clock', 'undo', 'timeout']);
 // A running clock may differ this much from the scoreboard before it is reset
 // to the scoreboard's time (the console sends whole seconds over a minute).
 const CLOCK_RESYNC_MS = 1500;
@@ -90,6 +112,8 @@ function rowToGame(row) {
     scoreboard: row.scoreboard ?? 'default',
     scoreboardManual: row.scoreboard_manual === 1,
     radio: row.radio === 1,
+    roster: parseRoster(row.roster),
+    box: parseBox(row.box),
     channels: { production: row.channel_production, sandbox: row.channel_sandbox },
     startedAt: row.started_at,
     endedAt: row.ended_at,
@@ -108,15 +132,18 @@ function scoringSnapshot(game) {
     outs: game.outs,
     note: game.note,
     clock: { ...game.clock },
+    box: structuredClone(game.box),
   };
 }
 
+// Snapshots from before the box score (§13) have no `box`: it stays as is.
 function restoreSnapshot(game, snapshot) {
   game.period = snapshot.period;
   game.line = snapshot.line.map((entry) => ({ home: entry.home, away: entry.away }));
   game.outs = snapshot.outs;
   game.note = snapshot.note;
   game.clock = { ...snapshot.clock };
+  if (snapshot.box) game.box = parseBox(JSON.stringify(snapshot.box));
 }
 
 function cloneGame(game) {
@@ -249,6 +276,7 @@ function movePeriod(game, delta, now) {
       game.line.pop();
     }
   }
+  boxPeriodStep(game, game.period, target);
   game.period = target;
   game.outs = 0;
   game.note = '';
@@ -342,6 +370,8 @@ function applyScoreboardReading(game, reading, now) {
       changes.clock = { ms, running };
     }
   }
+  // Basketball: team fouls, timeouts left, bonus, the timeout in progress (§13).
+  applyBoardBox(game, reading, changes);
   return Object.keys(changes).length > 0 ? changes : null;
 }
 
@@ -430,6 +460,10 @@ function resolveOptions(sportId, input, base) {
     if (!volleyballBestOfValues().includes(bestOf)) throw badRequest('options.bestOf must be 3 or 5.');
     if (sport.scoreMode === 'sets') options.bestOf = bestOf;
   }
+  if (input.timeouts !== undefined && input.timeouts !== null) {
+    const timeouts = integer(input.timeouts, 'options.timeouts', { min: 0, max: 10 });
+    if (sport.box) options.timeouts = timeouts;
+  }
   return options;
 }
 
@@ -477,28 +511,41 @@ export function activityContentState(game, { note } = {}) {
   }
   state.periodLabel = info.label;
   state.periodShort = info.short;
-  state.note = note ?? game.note;
+  // A timeout in progress shows as the note ("Timeout · MCHS", §13), so
+  // every app version's Live Activity shows it.
+  state.note = note ?? timeoutLabel(game) ?? game.note;
   if (game.clock.ms !== null && game.clock.ms !== undefined) {
     state.clockRemaining = clockRemainingMs(game.clock, game.updatedAt) / 1000;
     if (game.clock.running) state.clockEndsAt = (game.clock.anchor + game.clock.ms) / 1000;
   }
   if (sport.tracksOuts) state.outs = game.outs;
+  // Basketball: team fouls this quarter and bonus (§13).
+  const box = activityBox(game);
+  if (box) Object.assign(state, box);
   state.updatedAt = game.updatedAt / 1000;
   return state;
 }
 
 // What changed for Lock Screen purposes between two versions of a live game.
-// Only a note-only change is low priority (APNs priority 5); score, period,
-// status, outs and any clock change are high priority (10).
+// Only a note-only or team-foul-only change is low priority (APNs priority
+// 5); score, period, status, outs, any clock change, a timeout starting or
+// ending and bonus are high priority (10).
 export function activityChange(before, after) {
   if (!before || !after) return { changed: true, high: true };
   const signature = (game) => {
     const state = activityContentState(game);
     const clock = game.clock.ms === null ? null : game.clock.running ? ['running', game.clock.anchor + game.clock.ms] : ['stopped', game.clock.ms];
-    return JSON.stringify([state.status, state.homeScore, state.awayScore, state.homeSetScore, state.awaySetScore, state.periodLabel, state.periodShort, state.outs, clock]);
+    return JSON.stringify([
+      state.status, state.homeScore, state.awayScore, state.homeSetScore, state.awaySetScore, state.periodLabel, state.periodShort, state.outs, clock,
+      timeoutLabel(game), state.homeBonus, state.awayBonus,
+    ]);
+  };
+  const minor = (game) => {
+    const state = activityContentState(game);
+    return JSON.stringify([game.note, state.homeFouls, state.awayFouls]);
   };
   const high = signature(before) !== signature(after);
-  return { changed: high || before.note !== after.note, high };
+  return { changed: high || minor(before) !== minor(after), high };
 }
 
 // ---- service ----------------------------------------------------------------
@@ -680,9 +727,11 @@ export class GameService {
         periodMinutes: game.options.periodMinutes,
         overtimeMinutes: game.options.overtimeMinutes,
         bestOf: game.options.bestOf,
+        timeouts: sport.box ? (game.options.timeouts ?? sport.box.timeouts) : null,
       },
       rules: rulesFor(game.sport, game.options),
       radio: game.radio,
+      box: serializeBox(game),
     };
     if (authenticated) {
       json.scorekeeper = game.scorekeeperId === null ? null : { id: game.scorekeeperId, name: game.scorekeeperName };
@@ -705,12 +754,14 @@ export class GameService {
          sport = ?, home_name = ?, home_code = ?, home_color = ?, away_name = ?, away_code = ?, away_color = ?,
          location = ?, scheduled_at = ?, status = ?, period = ?, line = ?, outs = ?, note = ?, options = ?,
          clock_ms = ?, clock_anchor = ?, clock_running = ?, scorekeeper_id = ?, started_at = ?, ended_at = ?,
-         scoreboard = ?, scoreboard_manual = ?, gender = ?, level = ?, radio = ?, updated_at = ?, version = version + 1
+         scoreboard = ?, scoreboard_manual = ?, gender = ?, level = ?, radio = ?, roster = ?, box = ?, updated_at = ?,
+         version = version + 1
        WHERE id = ?`,
       game.sport, game.home.name, game.home.code, game.home.color, game.away.name, game.away.code, game.away.color,
       game.location, game.scheduledAt, game.status, game.period, JSON.stringify(game.line), game.outs, game.note,
       JSON.stringify(game.options), game.clock.ms, game.clock.anchor, game.clock.running ? 1 : 0, game.scorekeeperId,
-      game.startedAt, game.endedAt, game.scoreboard, game.scoreboardManual ? 1 : 0, game.gender, game.level, game.radio ? 1 : 0, now, game.id,
+      game.startedAt, game.endedAt, game.scoreboard, game.scoreboardManual ? 1 : 0, game.gender, game.level, game.radio ? 1 : 0,
+      JSON.stringify(game.roster), JSON.stringify(game.box), now, game.id,
     );
     return this.getGame(game.id);
   }
@@ -793,7 +844,10 @@ export class GameService {
       if (input.radio !== undefined) next.radio = boolean(input.radio, 'radio');
       if (input.location !== undefined) next.location = validateLocation(input.location);
       if (input.scheduledAt !== undefined) next.scheduledAt = validateScheduledAt(input.scheduledAt);
-      if (input.scoreboard !== undefined) next.scoreboard = parseScoreboardSetting(input.scoreboard);
+      if (input.scoreboard !== undefined) {
+        next.scoreboard = parseScoreboardSetting(input.scoreboard);
+        if (next.scoreboard !== before.scoreboard) boardReleased(next);
+      }
       if (input.options !== undefined) next.options = resolveOptions(next.sport, input.options, next.options);
 
       if (next.status === 'live') {
@@ -801,6 +855,7 @@ export class GameService {
           throw conflict('The game is already past the last period those options allow.');
         }
         alignClockWithOptions(next, this.#now());
+        timeoutsOptionChanged(next, before);
       }
 
       const unchanged = JSON.stringify({ ...next, version: 0 }) === JSON.stringify({ ...before, version: 0 });
@@ -931,6 +986,7 @@ export class GameService {
       next.line = [{ home: 0, away: 0 }];
       next.outs = 0;
       next.note = '';
+      next.box = startBox(next);
       resetClock(next, now);
       this.#recordEvent(id, { userId: user?.id ?? null, type: 'start', data: user ? {} : { auto: true, reason }, now });
       return this.#save(next, now);
@@ -959,15 +1015,17 @@ export class GameService {
       }
       this.#assertHolder(current, user);
       correction = type === 'set_score' && user.role === 'admin' && current.status === 'final';
-      if (current.status !== 'live' && !correction) throw conflict('This game is not live.');
-      if (SCOREBOARD_TYPES.includes(type) && this.#scoreboard?.controls(current)) {
+      const pregame = PREGAME_TYPES.includes(type) && current.status === 'scheduled';
+      if (current.status !== 'live' && !correction && !pregame) throw conflict('This game is not live.');
+      const boardControls = Boolean(this.#scoreboard?.controls(current));
+      if (SCOREBOARD_TYPES.includes(type) && boardControls) {
         throw new HttpError(409, 'scoreboard_active', 'The scoreboard is keeping score for this game. Switch to scoring by hand to change it yourself.');
       }
 
       before = current;
       const next = cloneGame(current);
       const prevState = scoringSnapshot(current);
-      const data = this.#applyAction(next, type, body, now);
+      const data = this.#applyAction(next, type, body, now, { boardControls });
       this.#recordEvent(id, { userId: user.id, actionId, type, data, prevState, now });
       return this.#save(next, now);
     });
@@ -976,13 +1034,15 @@ export class GameService {
     return { game, duplicate };
   }
 
-  #applyAction(game, type, body, now) {
+  #applyAction(game, type, body, now, { boardControls = false } = {}) {
     const sport = getSport(game.sport);
     switch (type) {
       case 'score': {
         const team = oneOf(body.team, 'team', ['home', 'away']);
         const points = integer(body.points, 'points', { min: -10, max: 10 });
         if (points === 0) throw badRequest('points must not be 0.');
+        // Optional `player` (§13): the points count for them too.
+        const player = body.player === undefined || body.player === null ? null : creditPoints(game, team, body.player, points);
         const entry = currentLineEntry(game);
         const value = entry[team] + points;
         if (value > MAX_SCORE) throw conflict('That score is too high.');
@@ -992,8 +1052,36 @@ export class GameService {
         // points belong to that set.
         else if (sport.scoreMode === 'sets') throw conflict("A set's points can't go below 0.");
         else if (!takePoints(game.line, game.period, team, -points)) throw conflict("A team's score can't go below 0.");
-        return { team, points };
+        return player ? { team, points, player } : { team, points };
       }
+      // A player's points without the team's (§13): the scoreboard keeps the
+      // team score, or the points were scored before the player was tagged.
+      case 'player_points': {
+        requireBox(game);
+        const team = oneOf(body.team, 'team', ['home', 'away']);
+        const points = integer(body.points, 'points', { min: -10, max: 10 });
+        if (points === 0) throw badRequest('points must not be 0.');
+        return { team, points, player: creditPoints(game, team, body.player, points) };
+      }
+      case 'foul':
+        return applyFoul(game, body, { boardControls });
+      case 'timeout': {
+        const data = applyTimeout(game, body);
+        // The clock is stopped for a timeout; a stop reaching us late keeps
+        // the time the scorekeeper saw (as the clock's own stop does).
+        if (data.op === 'call' && game.clock.ms !== null && game.clock.running) {
+          const startedWithMs = game.clock.ms;
+          stopClock(game, now);
+          if (body.remainingMs !== undefined && body.remainingMs !== null) {
+            const seen = milliseconds(body.remainingMs, 'remainingMs', { min: 0, max: MAX_CLOCK_MS });
+            game.clock.ms = Math.min(Math.max(seen, game.clock.ms), startedWithMs);
+          }
+          data.clockStoppedAt = game.clock.ms;
+        }
+        return data;
+      }
+      case 'roster':
+        return applyRoster(game, body);
       case 'set_score': {
         const home = integer(body.home, 'home', { min: 0, max: MAX_SCORE });
         const away = integer(body.away, 'away', { min: 0, max: MAX_SCORE });
@@ -1035,6 +1123,7 @@ export class GameService {
           if (game.clock.running) throw conflict('The clock is already running.');
           if (game.clock.ms <= 0) throw conflict('The clock is at 0:00. Set it before starting.');
           game.clock = { ms: game.clock.ms, anchor: now, running: true };
+          clockStarted(game);
         } else if (op === 'stop') {
           if (!game.clock.running) throw conflict('The clock is already stopped.');
           const startedWithMs = game.clock.ms;
@@ -1125,6 +1214,7 @@ export class GameService {
       if (!before || before.status !== 'live' || before.scoreboardManual) return null;
       const next = cloneGame(before);
       next.scoreboardManual = true;
+      boardReleased(next);
       const now = this.#now();
       this.#recordEvent(id, { type: 'scoreboard_mode', data: { manual: true, reason }, now });
       return this.#save(next, now);
@@ -1207,6 +1297,7 @@ export class GameService {
       if (before.scoreboardManual === value) return before;
       const next = cloneGame(before);
       next.scoreboardManual = value;
+      if (value) boardReleased(next);
       const now = this.#now();
       this.#recordEvent(id, { userId: user.id, type: 'scoreboard_mode', data: { manual: value }, now });
       return this.#save(next, now);
@@ -1234,6 +1325,7 @@ export class GameService {
       next.status = 'final';
       next.endedAt = now;
       next.note = '';
+      next.box.timeout = null;
       this.#recordEvent(id, { userId: user?.id ?? null, type: 'end', data: reason ? { auto, reason } : { auto }, now });
       return this.#save(next, now);
     });

@@ -61,6 +61,12 @@ export const SPORTS = deepFreeze({
     ],
     clock: { available: true, defaultEnabled: true, periodMinutes: 8, overtimeMinutes: 4 },
     notes: ['Timeout', 'Halftime', 'End of Quarter'],
+    // The box score (§13, server/box.js): rosters, player points and fouls,
+    // team fouls (NFHS: per quarter, overtime continuing the 4th) and bonus
+    // at the opponent's `bonusFouls`th, a player out at `foulOut` fouls, and
+    // `timeouts` a game (the game's options.timeouts) plus
+    // `overtimeTimeouts` per overtime.
+    box: { bonusFouls: 5, foulOut: 5, timeouts: 5, overtimeTimeouts: 1 },
   },
   football: {
     name: 'Football',
@@ -137,6 +143,7 @@ export function defaultOptions(sportId) {
     periodMinutes: clock ? sport.clock.periodMinutes : null,
     overtimeMinutes: clock && sport.overtime ? sport.clock.overtimeMinutes : null,
     bestOf: sport.scoreMode === 'sets' ? (sport.defaults?.bestOf ?? 3) : null,
+    timeouts: sport.box ? sport.box.timeouts : null,
   };
 }
 

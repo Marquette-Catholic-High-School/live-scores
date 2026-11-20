@@ -2000,3 +2000,109 @@ hr { border: 0; border-top: 1px solid var(--border); margin: var(--space-1) 0; }
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ---- Box score (ARCHITECTURE.md §13, basketball) ---- */
+
+/* A team's fouls this quarter, timeouts left and bonus. */
+.team-stats { display: inline-flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 2px 0; color: var(--text-muted); font-size: 0.75rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.team-stats__item + .team-stats__item::before { content: "·"; margin: 0 0.4em; color: var(--text-subtle); }
+.team-stats .bonus-badge { margin-left: 0.5em; }
+
+.bonus-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+  background: var(--live);
+  color: #ffffff;
+  font-size: 0.6875rem;
+  font-weight: 850;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.note-pill--timeout { background: var(--live-soft); color: var(--live); }
+
+/* The single-game page: under each team's score. */
+.board__stats { display: flex; justify-content: center; min-height: 1.4em; font-size: clamp(0.8125rem, 1.4vw, 1.25rem); }
+.board__stats .team-stats { font-size: inherit; }
+
+/* Box score tables: one per team, side by side when there's room. */
+.boxscore { display: grid; gap: var(--space-3); }
+
+@media (min-width: 760px) {
+  .boxscore { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; }
+}
+
+.boxscore__team { background: var(--surface); box-shadow: var(--shadow-sm); }
+.boxscore__table { font-size: 0.9375rem; }
+.boxscore__head { display: flex; align-items: center; gap: 0.6em; padding: 10px 12px; border-bottom: 1px solid var(--border); font-weight: 750; }
+.boxscore__table .boxscore__number { width: 3em; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.boxscore__name { width: 99%; font-weight: 650; white-space: normal; }
+.boxscore__table .is-out > * { color: var(--text-subtle); }
+.boxscore__out { margin-left: 0.6em; padding: 0 6px; border-radius: var(--radius-pill); background: var(--danger-soft); color: var(--danger); font-size: 0.6875rem; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; }
+.boxscore__empty { color: var(--text-muted); white-space: normal; }
+.boxscore__table tfoot th,
+.boxscore__table tfoot td { border-top: 1px solid var(--border-strong); border-bottom: 0; background: var(--surface-2); font-weight: 750; white-space: normal; }
+
+/* The console: players to tap on each pad, fouls, timeouts, rosters. */
+.pad__roster { display: grid; gap: var(--space-2); }
+.pad__players { display: flex; flex-wrap: wrap; gap: 6px; }
+.pad__hint { margin: 0; color: var(--text-muted); font-size: 0.8125rem; line-height: 1.35; }
+
+.player-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+  color: var(--text);
+  font: 700 0.9375rem/1.1 var(--font-sans);
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.player-chip__number { font-weight: 850; font-variant-numeric: tabular-nums; }
+.player-chip__name { max-width: 8em; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.player-chip__fouls { color: var(--danger); font-size: 0.75rem; font-weight: 850; }
+.player-chip__fouls:empty { display: none; }
+.player-chip[aria-pressed="true"] { border-color: transparent; background: var(--team); color: var(--team-ink); box-shadow: var(--chip-ring); }
+.player-chip[aria-pressed="true"] .player-chip__fouls { color: inherit; }
+.player-chip.is-out { border-style: dashed; opacity: 0.6; }
+.player-chip.is-out .player-chip__name { text-decoration: line-through; }
+
+.pad__box { display: grid; gap: var(--space-2); }
+.pad__fouls { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; }
+.pad__fouls .btn { min-height: 52px; }
+.pad__stats { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; color: var(--text-muted); font-size: 0.8125rem; font-weight: 700; }
+.pad__stat--source { color: var(--text-subtle); font-weight: 600; }
+.pad__timeout { min-height: 52px; }
+
+.roster__summary { display: flex; align-items: center; min-height: 44px; list-style: none; cursor: pointer; }
+.roster__summary::-webkit-details-marker { display: none; }
+.roster__summary::after { content: "▾"; margin-left: auto; color: var(--text-subtle); }
+.roster:not([open]) .roster__summary::after { content: "▸"; }
+.roster__summary .control__title { margin: 0; }
+.roster__teams { display: grid; gap: var(--space-4); margin-top: var(--space-3); }
+
+@media (min-width: 720px) {
+  .roster__teams { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+}
+
+.roster__title { display: flex; align-items: center; gap: 0.6em; margin: 0 0 var(--space-2); font-size: 1rem; }
+.roster__list { display: grid; gap: 2px; margin: 0 0 var(--space-3); padding: 0; list-style: none; }
+.roster__player { display: flex; align-items: center; gap: var(--space-2); min-height: 44px; padding: 2px 0; border-bottom: 1px solid var(--border); }
+.roster__player.is-pending { opacity: 0.7; }
+.roster__num { min-width: 2.6em; font-weight: 850; font-variant-numeric: tabular-nums; }
+.roster__pname { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.roster__empty { padding: var(--space-2) 0; color: var(--text-muted); }
+.roster__add { display: grid; grid-template-columns: 4.5em minmax(0, 1fr) auto; gap: var(--space-2); }
+.roster__add[hidden] { display: none; }
+
+.console__box { display: grid; gap: var(--space-3); }
+.console__box-title { margin: 0; font-size: 1.125rem; }

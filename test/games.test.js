@@ -5,7 +5,7 @@ import { act, createGame, gameInput, hexToken, startGame, startTestApp } from '.
 const HOUR = 60 * 60 * 1000;
 const GAME_KEYS = [
   'id', 'sport', 'gender', 'level', 'sportName', 'symbol', 'status', 'scheduledAt', 'location', 'home', 'away', 'period', 'periodLabel',
-  'periodShort', 'isOvertime', 'line', 'outs', 'note', 'clock', 'options', 'rules', 'radio', 'scorekeeper', 'scoreboard', 'canStartAt',
+  'periodShort', 'isOvertime', 'line', 'outs', 'note', 'clock', 'options', 'rules', 'radio', 'box', 'scorekeeper', 'scoreboard', 'canStartAt',
   'startedAt', 'endedAt', 'updatedAt', 'version',
 ];
 
@@ -31,7 +31,7 @@ describe('games', () => {
     assert.deepEqual(Object.keys(game), GAME_KEYS);
     assert.equal(game.status, 'scheduled');
     assert.deepEqual(game.home, { name: 'Marquette', code: 'MAR', color: '#12214D', score: 0, setScore: null });
-    assert.deepEqual(game.options, { clockEnabled: true, periodMinutes: 8, overtimeMinutes: 4, bestOf: null });
+    assert.deepEqual(game.options, { clockEnabled: true, periodMinutes: 8, overtimeMinutes: 4, bestOf: null, timeouts: 5 });
     assert.equal(game.rules.id, 'basketball');
     assert.equal(game.canStartAt, scheduledAt - 120 * 60 * 1000);
     assert.equal(game.scorekeeper, null);
@@ -42,11 +42,11 @@ describe('games', () => {
     const withDefaultHome = await admin.post('/api/games', { sport: 'volleyball', away: { name: 'Lincoln', code: 'LIN', color: '#B22234' }, scheduledAt, options: { bestOf: 5, clockEnabled: true } });
     assert.equal(withDefaultHome.status, 200);
     assert.deepEqual(withDefaultHome.json.game.home, { name: 'Marquette', code: 'MAR', color: '#12214D', score: 0, setScore: 0 });
-    assert.deepEqual(withDefaultHome.json.game.options, { clockEnabled: false, periodMinutes: null, overtimeMinutes: null, bestOf: 5 });
+    assert.deepEqual(withDefaultHome.json.game.options, { clockEnabled: false, periodMinutes: null, overtimeMinutes: null, bestOf: 5, timeouts: null });
     assert.equal(withDefaultHome.json.game.rules.periods.length, 5);
 
     const custom = await admin.post('/api/games', gameInput({ sport: 'football', options: { periodMinutes: 10, overtimeMinutes: 5 } }));
-    assert.deepEqual(custom.json.game.options, { clockEnabled: true, periodMinutes: 10, overtimeMinutes: 5, bestOf: null });
+    assert.deepEqual(custom.json.game.options, { clockEnabled: true, periodMinutes: 10, overtimeMinutes: 5, bestOf: null, timeouts: null });
 
     const invalid = [
       { sport: 'curling' },
@@ -139,7 +139,7 @@ describe('games', () => {
     assert.equal(patched.json.game.version, game.version + 1);
     const sportChange = await admin.patch(`/api/games/${game.id}`, { sport: 'soccer' });
     assert.equal(sportChange.json.game.sport, 'soccer');
-    assert.deepEqual(sportChange.json.game.options, { clockEnabled: true, periodMinutes: 40, overtimeMinutes: 10, bestOf: null });
+    assert.deepEqual(sportChange.json.game.options, { clockEnabled: true, periodMinutes: 40, overtimeMinutes: 10, bestOf: null, timeouts: null });
 
     await startGame(admin, game.id);
     const locked = await admin.patch(`/api/games/${game.id}`, { away: { name: 'Someone Else' } });

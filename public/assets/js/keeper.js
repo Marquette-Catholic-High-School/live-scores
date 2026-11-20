@@ -8,14 +8,14 @@ import { ApiError, api, fetchConfig, fetchSession, gameApiPath, loginUrl } from 
 import { clockRemainingMs, formatClock, onTick, serverNow, splitClock } from './clock.js';
 import { ActionQueue } from './queue.js';
 import {
-  SIDES, finalLabel, hasStarted, isHalfInnings, isSetsMode, lineScoreTable, matchup, maxPeriodIndex, outsIndicator, periodInfoAt,
-  scoreLine, scoreboardFields, startsByItself, statusBadge, teamChip, updateTeamChip,
+  SIDES, boxScore, displayNote, finalLabel, hasStarted, isHalfInnings, isSetsMode, lineScoreTable, matchup, maxPeriodIndex, outsIndicator,
+  periodInfoAt, scoreLine, scoreboardFields, startsByItself, statusBadge, teamChip, teamStats, updateTeamChip,
 } from './render.js';
 import { connectStream } from './sse.js';
 import { GameStore, coalesce } from './store.js';
 import {
   $, applyTeamColor, clear, confirmDialog, el, emptyState, endOfDay, errorNotice, fillSchoolName, formatDay, formatDayTime, formatDuration,
-  formatTime, loadingState, renderConnection, setBusy, setTimeZone, syncChildren, toast,
+  formatTime, loadingState, openDialog, renderConnection, setBusy, setTimeZone, syncChildren, toast,
 } from './ui.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -47,12 +47,21 @@ const ACTION_NAMES = {
   outs: 'An outs change',
   note: 'A note',
   undo: 'An undo',
+  player_points: 'A player’s points',
+  foul: 'A foul',
+  timeout: 'A timeout',
+  roster: 'A roster change',
 };
+
+// Jersey numbers: "0"–"99", and "00" (server/box.js).
+const PLAYER_NUMBER = /^\d{1,2}$/;
 
 // What the scoreboard sets while it drives a game (ARCHITECTURE.md §11): the
 // server refuses these then (409 scoreboard_active) and their controls are
-// locked. Notes, Start and End game stay with the scorekeeper.
-const FEED_ACTION_TYPES = new Set(['score', 'set_score', 'period', 'clock', 'undo']);
+// locked. Notes, Start and End game stay with the scorekeeper, and so do the
+// players' points and fouls in a box score (§13; the board keeps the team
+// fouls, timeouts and bonus).
+const FEED_ACTION_TYPES = new Set(['score', 'set_score', 'period', 'clock', 'undo', 'timeout']);
 
 const FEED_STATE_LABELS = {
   connecting: 'Connecting',
@@ -553,6 +562,9 @@ class ConsoleView {
     this.ui = null;
     this.rulesKey = '';
     this.destroyed = false;
+    // Box score (§13): the player tapped on each team's pad, credited with the
+    // next points or foul tapped there.
+    this.selected = { home: null, away: null };
     this.root = el('div', { class: 'console' }, loadingState('Loading game…'));
     this.cleanups = [queue.subscribe(() => this.renderPending()), onTick(() => this.tick())];
     const cached = store.get(id);
@@ -624,6 +636,7 @@ class ConsoleView {
     const game = this.game;
     const { rules } = game;
     const sets = isSetsMode(game);
+    const hasBox = Boolean(rules.box && game.box);
     const ui = {};
     this.ui = ui;
 
@@ -680,7 +693,12 @@ class ConsoleView {
     // Scoreboard feed (ARCHITECTURE.md §11)
     ui.feedState = el('span', { class: 'control__state' });
     ui.feedText = el('p', { class: 'feed__text', 'aria-live': 'polite' });
-    ui.feedHint = el('p', { class: 'control__hint', text: 'Notes and End game stay with you. If the scoreboard is down or wrong, score by hand.' });
+    ui.feedHint = el('p', {
+      class: 'control__hint',
+      text: hasBox
+        ? 'Players’ points and fouls, notes and End game stay with you. If the scoreboard is down or wrong, score by hand.'
+        : 'Notes and End game stay with you. If the scoreboard is down or wrong, score by hand.',
+    });
     ui.feedManual = el('button', { type: 'button', class: 'btn', text: 'Score by hand', on: { click: (event) => this.setFeedManual(event.currentTarget, true) } });
     ui.feedAuto = el('button', { type: 'button', class: 'btn btn--primary', text: 'Use the scoreboard', on: { click: (event) => this.setFeedManual(event.currentTarget, false) } });
     ui.feedActions = el('div', { class: 'feed__actions' }, ui.feedManual, ui.feedAuto);
@@ -708,6 +726,8 @@ class ConsoleView {
 
     // Scoring pads
     ui.pads = {};
+    ui.padButtons = {};
+    ui.padBox = hasBox ? {} : null;
     const pad = (side) => {
       const team = game[side];
       const buttons = rules.scoring.map((entry) => {
@@ -730,14 +750,19 @@ class ConsoleView {
         el('span', { class: 'score-btn__label', text: '−1' }),
         el('span', { class: 'score-btn__points', text: 'Fix' }),
       );
+      const box = hasBox ? this.buildPadBox(side, team) : null;
       const root = el(
         'section',
         { class: 'pad', 'aria-label': `${team.name} scoring` },
         el('div', { class: 'pad__head' }, teamChip(team), el('span', { class: 'pad__name', text: team.name }), el('span', { class: 'pad__side', text: side === 'home' ? 'Home' : 'Away' })),
+        box?.roster ?? null,
         el('div', { class: 'pad__buttons' }, buttons, minus),
+        box?.row ?? null,
       );
       applyTeamColor(root, team.color);
       ui.pads[side] = root;
+      ui.padButtons[side] = [...buttons, minus];
+      if (box) ui.padBox[side] = box;
       return root;
     };
 
@@ -790,7 +815,9 @@ class ConsoleView {
 
     // Notes
     // A sport may come without preset notes; the custom note still works.
-    ui.noteChips = (rules.notes ?? []).map((text) => el('button', { type: 'button', class: 'chip-btn', 'aria-pressed': 'false', text, on: { click: () => this.note(this.game.note === text ? '' : text) } }));
+    // With a box score, team timeouts (on the pads) replace the Timeout note.
+    const notes = (rules.notes ?? []).filter((text) => !(hasBox && text === 'Timeout'));
+    ui.noteChips = notes.map((text) => el('button', { type: 'button', class: 'chip-btn', 'aria-pressed': 'false', text, on: { click: () => this.note(this.game.note === text ? '' : text) } }));
     ui.noteClear = el('button', { type: 'button', class: 'chip-btn chip-btn--clear', text: 'Clear note', on: { click: () => this.note('') } });
     ui.noteInput = el('input', { class: 'input', type: 'text', maxLength: 40, placeholder: 'Custom note', autocomplete: 'off', enterKeyHint: 'send', 'aria-label': 'Custom note, up to 40 characters' });
     const noteForm = el('form', { class: 'inline-form' }, ui.noteInput, el('button', { type: 'submit', class: 'btn btn--lg', text: 'Show' }));
@@ -829,7 +856,11 @@ class ConsoleView {
     controls.push(el('section', { class: 'control control--end' }, ui.end, ui.endHint));
 
     ui.fieldset = el('fieldset', { class: 'console__fieldset' }, el('legend', { class: 'sr-only', text: 'Scoring controls' }),
-      el('div', { class: 'console__scoring' }, feedLock(el('div', { class: 'pads' }, pad('home'), pad('away'))), el('div', { class: 'console__controls' }, controls)));
+      el('div', { class: 'console__scoring' }, hasBox
+        // The pads stay open while the scoreboard runs the game: their
+        // buttons credit players then (renderPadBox locks the rest).
+        ? el('div', { class: 'pads' }, pad('home'), pad('away'))
+        : feedLock(el('div', { class: 'pads' }, pad('home'), pad('away'))), el('div', { class: 'console__controls' }, controls)));
     ui.scoring = ui.fieldset;
 
     // Final / canceled
@@ -843,8 +874,58 @@ class ConsoleView {
 
     ui.line = el('section', { class: 'console__line', 'aria-label': 'Line score' });
     ui.lineKey = '';
+    ui.roster = hasBox ? this.buildRoster() : null;
+    ui.boxScore = hasBox ? el('section', { class: 'console__box', 'aria-label': 'Box score' }) : null;
+    ui.boxKey = '';
 
-    this.root.replaceChildren(head, ui.holder, ui.feed, ui.pregame, ui.scoring, ui.final, ui.line);
+    // Rosters: under Start before the game, under the pads during it.
+    this.root.replaceChildren(...[head, ui.holder, ui.feed, ui.pregame, ui.scoring, ui.roster, ui.final, ui.line, ui.boxScore].filter(Boolean));
+  }
+
+  // A team pad's box score part (§13): its players to tap before points or a
+  // foul, then Foul, the team's fouls and bonus, and Timeout.
+  buildPadBox(side, team) {
+    const players = el('div', { class: 'pad__players', role: 'group', 'aria-label': `${team.name} players` });
+    const hint = el('p', { class: 'pad__hint', 'aria-live': 'polite' });
+    const foul = el('button', { type: 'button', class: 'btn btn--lg pad__foul', text: 'Foul', on: { click: () => this.foul(side, 1) } });
+    const foulFix = el('button', { type: 'button', class: 'btn btn--lg', text: '−1', on: { click: () => this.foul(side, -1) } });
+    const stats = el('div', { class: 'pad__stats' });
+    const timeout = el('button', { type: 'button', class: 'btn btn--lg pad__timeout', on: { click: () => this.timeout(side) } });
+    const row = el('div', { class: 'pad__box' }, el('div', { class: 'pad__fouls' }, foul, foulFix), stats, timeout);
+    return { roster: el('div', { class: 'pad__roster' }, players, hint), row, players, hint, foul, foulFix, stats, timeout, chips: new Map(), key: null };
+  }
+
+  // Rosters (§13): typed in before the game, fixed or added to during it.
+  buildRoster() {
+    const game = this.game;
+    const ui = this.ui;
+    ui.rosterTeams = {};
+    const team = (side) => {
+      const t = game[side];
+      const list = el('ul', { class: 'roster__list' });
+      const number = el('input', {
+        class: 'input roster__number', type: 'text', inputmode: 'numeric', maxLength: 2, placeholder: '#', autocomplete: 'off', 'aria-label': `${t.name} player number`,
+      });
+      const name = el('input', {
+        class: 'input roster__name', type: 'text', maxLength: 40, placeholder: 'Player name', autocomplete: 'off', enterKeyHint: 'done', 'aria-label': `${t.name} player name`,
+      });
+      const form = el('form', { class: 'roster__add', novalidate: true }, number, name, el('button', { type: 'submit', class: 'btn btn--primary', text: 'Add' }));
+      form.addEventListener('submit', (event) => {
+        event.preventDefault();
+        this.addPlayer(side, number, name);
+      });
+      for (const input of [number, name]) input.addEventListener('input', () => input.setCustomValidity(''));
+      const root = el('div', { class: 'roster__team' }, el('h3', { class: 'roster__title' }, teamChip(t), el('span', { text: t.name })), list, form);
+      ui.rosterTeams[side] = { list, number, name, form, key: null };
+      return root;
+    };
+    ui.rosterHint = el('p', { class: 'control__hint' });
+    const details = el('details', { class: 'control roster' }, el('summary', { class: 'roster__summary' }, el('h2', { class: 'control__title', text: 'Rosters' })), ui.rosterHint, el('div', { class: 'roster__teams' }, team('home'), team('away')));
+    ui.rosterTouched = false;
+    details.querySelector('summary').addEventListener('click', () => {
+      ui.rosterTouched = true;
+    });
+    return details;
   }
 
   // ---- rendering ----
@@ -864,8 +945,13 @@ class ConsoleView {
       const s = ui.summary[side];
       updateTeamChip(s.chip, team);
       s.name.textContent = team.name;
-      s.sub.textContent = sets && started ? `Sets ${team.score}` : '';
-      s.sub.hidden = !(sets && started);
+      if (game.box && live) {
+        s.sub.replaceChildren(teamStats(game, side, { compact: true }));
+        s.sub.hidden = false;
+      } else {
+        s.sub.textContent = sets && started ? `Sets ${team.score}` : '';
+        s.sub.hidden = !(sets && started);
+      }
     }
     ui.sumStatus.className = `badge badge--${game.status}`;
     ui.sumStatus.textContent = live ? 'Live' : game.status === 'scheduled' ? 'Upcoming' : finalLabel(game);
@@ -875,8 +961,10 @@ class ConsoleView {
     ui.sumClock.classList.toggle('is-stopped', Boolean(game.clock && !game.clock.running));
     ui.sumOuts.root.hidden = !(live && game.outs !== null && game.outs !== undefined);
     if (!ui.sumOuts.root.hidden) ui.sumOuts.update(game.outs);
-    ui.sumNote.textContent = game.note;
-    ui.sumNote.hidden = !(live && game.note);
+    const note = displayNote(game);
+    ui.sumNote.textContent = note;
+    ui.sumNote.hidden = !(live && note);
+    ui.sumNote.classList.toggle('note-pill--timeout', Boolean(live && game.box?.timeout));
 
     ui.pregame.hidden = game.status !== 'scheduled';
     ui.scoring.hidden = !live;
@@ -894,6 +982,15 @@ class ConsoleView {
       ui.lineKey = lineKey;
     }
     ui.line.hidden = !started;
+    if (ui.boxScore) {
+      const boxKey = `${game.version}`;
+      if (ui.boxKey !== boxKey) {
+        const table = boxScore(game);
+        ui.boxScore.replaceChildren(...(table ? [el('h2', { class: 'console__box-title', text: 'Box score' }), table] : []));
+        ui.boxKey = boxKey;
+      }
+      ui.boxScore.hidden = !(started && ui.boxScore.childElementCount > 0);
+    }
 
     setWakeLock(live || game.status === 'scheduled');
     if (previous && previous.status !== game.status) window.scrollTo({ top: 0 });
@@ -1023,6 +1120,118 @@ class ConsoleView {
 
     for (const chip of ui.noteChips) chip.setAttribute('aria-pressed', String(chip.textContent === game.note));
     ui.noteClear.disabled = !game.note;
+
+    if (ui.padBox) for (const side of SIDES) this.renderPadBox(side);
+  }
+
+  // A pad's players (rebuilt when the roster changes), which one is tapped,
+  // the team's fouls, bonus and timeouts. While the scoreboard runs the game
+  // the points buttons and Foul credit the tapped player only.
+  renderPadBox(side) {
+    const game = this.game;
+    const ui = this.ui;
+    const pad = ui.padBox?.[side];
+    if (!pad || !game.box) return;
+    const locked = this.feedLocked();
+    const players = game.box.players[side];
+    const key = JSON.stringify(players.map((p) => [p.id, p.number, p.name]));
+    if (pad.key !== key) {
+      pad.key = key;
+      pad.chips.clear();
+      pad.players.replaceChildren(...players.map((player) => {
+        const chip = el(
+          'button',
+          { type: 'button', class: 'player-chip', 'aria-pressed': 'false', on: { click: () => this.select(side, player.id) } },
+          el('span', { class: 'player-chip__number', text: `#${player.number}` }),
+          el('span', { class: 'player-chip__name', text: shortName(player.name) }),
+          el('span', { class: 'player-chip__fouls' }),
+        );
+        pad.chips.set(player.id, chip);
+        return chip;
+      }));
+    }
+    if (this.selected[side] && !players.some((p) => p.id === this.selected[side])) this.selected[side] = null;
+    const selected = this.selected[side];
+    for (const player of players) {
+      const chip = pad.chips.get(player.id);
+      chip.setAttribute('aria-pressed', String(selected === player.id));
+      chip.classList.toggle('is-out', player.fouledOut);
+      chip.querySelector('.player-chip__fouls').textContent = player.fouls > 0 ? `${player.fouls}F` : '';
+      chip.setAttribute('aria-label', `#${player.number} ${player.name}: ${player.points} ${player.points === 1 ? 'point' : 'points'}, ${player.fouls} ${player.fouls === 1 ? 'foul' : 'fouls'}${player.fouledOut ? ', fouled out' : ''}`);
+    }
+    pad.players.hidden = players.length === 0;
+    const picked = players.find((p) => p.id === selected);
+    let hint;
+    if (players.length === 0) hint = locked ? 'Add players under Rosters to credit their points and fouls.' : 'Add players under Rosters to credit points and fouls to them.';
+    else if (picked) hint = `#${picked.number} ${picked.name}: tap points or Foul.`;
+    else hint = locked ? 'The scoreboard keeps the team score. Tap a player, then their points or Foul.' : 'Tap a player first to credit them, or just tap points.';
+    if (pad.hint.textContent !== hint) pad.hint.textContent = hint;
+
+    for (const button of ui.padButtons[side]) button.disabled = locked && !selected;
+    pad.foul.disabled = locked && !selected;
+    pad.foulFix.disabled = locked && !selected;
+    pad.foul.setAttribute('aria-label', picked ? `Foul on #${picked.number} ${picked.name}` : `Team foul on ${game[side].name}`);
+    pad.foulFix.setAttribute('aria-label', picked ? `Take a foul back from #${picked.number} ${picked.name}` : `Take a team foul back from ${game[side].name}`);
+
+    const box = game.box;
+    const left = box.timeoutsLeft[side];
+    const fouls = box.fouls[side];
+    pad.stats.replaceChildren(...[
+      el('span', { class: 'pad__stat', text: `${fouls} team ${fouls === 1 ? 'foul' : 'fouls'}` }),
+      box.bonus[side] ? el('span', { class: 'bonus-badge', text: 'Bonus' }) : null,
+      locked ? el('span', { class: 'pad__stat', text: `${left} ${left === 1 ? 'timeout' : 'timeouts'} left` }) : null,
+      locked ? el('span', { class: 'pad__stat pad__stat--source', text: 'From the scoreboard' }) : null,
+    ].filter(Boolean));
+    pad.timeout.hidden = locked;
+    const on = box.timeout === side;
+    pad.timeout.textContent = on ? 'End timeout' : `Timeout · ${left} left`;
+    pad.timeout.classList.toggle('btn--stop', on);
+    pad.timeout.disabled = !on && left <= 0;
+    pad.timeout.setAttribute('aria-label', on ? `End ${game[side].name}’s timeout` : `Timeout ${game[side].name}, ${left} left`);
+  }
+
+  // Rosters: who may change them, and the players with any still being saved.
+  renderRoster() {
+    const game = this.game;
+    const ui = this.ui;
+    if (!ui?.roster || !game.box) return;
+    const open = game.status === 'scheduled' || game.status === 'live';
+    ui.roster.hidden = !open;
+    if (!open) return;
+    // Open before the game (that's when they're typed in), closed once it's
+    // live, unless the scorekeeper opened or closed it themselves.
+    if (!ui.rosterTouched) ui.roster.open = game.status === 'scheduled';
+    const editable = this.canScore();
+    const hint = editable
+      ? 'Type in each team’s players before the game. During it, tap a player on the team’s pad before their points or foul.'
+      : game.scorekeeper ? `Only ${game.scorekeeper.name} or an admin can change the rosters.` : 'Claim the game to type in the rosters.';
+    if (ui.rosterHint.textContent !== hint) ui.rosterHint.textContent = hint;
+    const pending = queue.pendingFor(this.id).filter((item) => item.body.type === 'roster');
+    for (const side of SIDES) {
+      const team = ui.rosterTeams[side];
+      const players = game.box.players[side];
+      const adds = pending.filter((item) => item.body.op === 'add' && item.body.team === side);
+      const key = JSON.stringify([players.map((p) => [p.id, p.number, p.name, p.points, p.fouls]), adds.map((item) => [item.body.number, item.body.name]), editable]);
+      team.form.hidden = !editable;
+      if (team.key === key) continue;
+      team.key = key;
+      const rows = players.map((player) => el(
+        'li',
+        { class: 'roster__player' },
+        el('span', { class: 'roster__num', text: `#${player.number}` }),
+        el('span', { class: 'roster__pname', text: player.name }),
+        editable ? el('button', { type: 'button', class: 'btn btn--sm btn--ghost', text: 'Edit', 'aria-label': `Edit #${player.number} ${player.name}`, on: { click: () => this.editPlayer(side, player) } }) : null,
+        // Players with points or fouls stay (the server refuses): fix them instead.
+        editable && player.points === 0 && player.fouls === 0
+          ? el('button', { type: 'button', class: 'btn btn--sm btn--ghost', text: 'Remove', 'aria-label': `Remove #${player.number} ${player.name}`, on: { click: () => this.rosterAction({ op: 'remove', team: side, player: player.id }) } })
+          : null,
+      ));
+      for (const item of adds) {
+        rows.push(el('li', { class: 'roster__player is-pending' }, el('span', { class: 'roster__num', text: `#${item.body.number}` }), el('span', { class: 'roster__pname', text: item.body.name }), el('span', { class: 'pending-tag', text: 'Saving…' })));
+      }
+      if (rows.length === 0) rows.push(el('li', { class: 'roster__empty', text: 'No players yet.' }));
+      team.list.replaceChildren(...rows);
+    }
   }
 
   renderFinal() {
@@ -1043,6 +1252,7 @@ class ConsoleView {
     if (!ui || !game) return;
     const pending = queue.pendingFor(this.id);
     const sets = isSetsMode(game);
+    this.renderRoster();
     const unsentScoreChanges = pending.some((item) => ['score', 'set_score', 'undo'].includes(item.body.type));
     ui.fix.sync(game, unsentScoreChanges);
     ui.finalFix.sync(game, unsentScoreChanges);
@@ -1126,7 +1336,110 @@ class ConsoleView {
 
   score(side, points) {
     haptic();
-    this.enqueue({ type: 'score', team: side, points });
+    const player = this.takeSelected(side);
+    // The scoreboard keeps the team score: only the player's points (§13).
+    if (this.game.box && this.feedLocked()) {
+      if (player) this.enqueue({ type: 'player_points', team: side, player, points });
+      return;
+    }
+    this.enqueue(player ? { type: 'score', team: side, points, player } : { type: 'score', team: side, points });
+  }
+
+  // ---- box score (§13) ----
+
+  select(side, playerId) {
+    haptic();
+    this.selected[side] = this.selected[side] === playerId ? null : playerId;
+    this.renderPadBox(side);
+  }
+
+  // The player tapped on a pad, now used up by the points or foul tapped.
+  takeSelected(side) {
+    const player = this.selected[side];
+    if (!player) return null;
+    this.selected[side] = null;
+    this.renderPadBox(side);
+    return player;
+  }
+
+  foul(side, delta) {
+    haptic();
+    const player = this.takeSelected(side);
+    if (this.feedLocked() && !player) return;
+    this.enqueue(player ? { type: 'foul', team: side, player, delta } : { type: 'foul', team: side, delta });
+  }
+
+  timeout(side) {
+    haptic();
+    if (this.game.box?.timeout === side) {
+      this.enqueue({ type: 'timeout', op: 'end' });
+      return;
+    }
+    // A timeout stops the clock; the time shown now is where it stops.
+    const action = { type: 'timeout', op: 'call', team: side };
+    if (this.expectedClockRunning()) action.remainingMs = Math.round(this.displayRemainingMs());
+    this.enqueue(action);
+  }
+
+  // Before the game too, unlike scoring (enqueue).
+  rosterAction(body) {
+    const game = this.game;
+    if (!game || !this.canScore() || (game.status !== 'scheduled' && game.status !== 'live')) return;
+    queue.enqueue(this.id, { type: 'roster', ...body });
+  }
+
+  addPlayer(side, numberInput, nameInput) {
+    const number = numberInput.value.trim();
+    const name = nameInput.value.trim();
+    const taken = this.game.box.players[side].some((p) => p.number === number)
+      || queue.pendingFor(this.id).some((item) => item.body.type === 'roster' && item.body.op === 'add' && item.body.team === side && item.body.number === number);
+    numberInput.setCustomValidity(!PLAYER_NUMBER.test(number) ? 'Enter a number from 0 to 99.' : taken ? `#${number} is already on the roster.` : '');
+    if (!numberInput.reportValidity()) return;
+    nameInput.setCustomValidity(name ? '' : 'Enter the player’s name.');
+    if (!nameInput.reportValidity()) return;
+    this.rosterAction({ op: 'add', team: side, number, name });
+    numberInput.value = '';
+    nameInput.value = '';
+    numberInput.focus();
+  }
+
+  async editPlayer(side, player) {
+    const team = this.game[side];
+    const result = await openDialog({
+      title: `Edit #${player.number} ${player.name}`,
+      closeOnBackdrop: false,
+      build: (body, actions, close) => {
+        const number = el('input', { class: 'input', type: 'text', inputmode: 'numeric', maxLength: 2, value: player.number, autocomplete: 'off', required: true });
+        const name = el('input', { class: 'input', type: 'text', maxLength: 40, value: player.name, autocomplete: 'off', required: true, autofocus: true });
+        const form = el(
+          'form',
+          { class: 'stack', novalidate: true },
+          el('label', { class: 'field' }, el('span', { class: 'field__label', text: 'Number' }), number),
+          el('label', { class: 'field' }, el('span', { class: 'field__label', text: 'Name' }), name),
+        );
+        const save = () => {
+          const value = { number: number.value.trim(), name: name.value.trim() };
+          const taken = this.game.box.players[side].some((p) => p.number === value.number && p.id !== player.id);
+          number.setCustomValidity(!PLAYER_NUMBER.test(value.number) ? 'Enter a number from 0 to 99.' : taken ? `#${value.number} is already on ${team.name}’s roster.` : '');
+          if (!number.reportValidity()) return;
+          name.setCustomValidity(value.name ? '' : 'Enter the player’s name.');
+          if (!name.reportValidity()) return;
+          close(value);
+        };
+        for (const input of [number, name]) input.addEventListener('input', () => input.setCustomValidity(''));
+        form.addEventListener('submit', (event) => {
+          event.preventDefault();
+          save();
+        });
+        body.append(form);
+        actions.append(
+          el('button', { type: 'button', class: 'btn btn--lg', text: 'Cancel', on: { click: () => close(undefined) } }),
+          el('button', { type: 'button', class: 'btn btn--lg btn--primary', text: 'Save', on: { click: save } }),
+        );
+      },
+    });
+    if (!result || (result.number === player.number && result.name === player.name)) return;
+    this.rosterAction({ op: 'edit', team: side, player: player.id, number: result.number, name: result.name });
   }
 
   period(delta) {
@@ -1147,9 +1460,14 @@ class ConsoleView {
   }
 
   // The clock button reflects the state after taps still waiting to be sent.
+  // A timeout waiting to be sent stops it too (§13).
   expectedClockRunning() {
-    const pendingClock = queue.pendingFor(this.id).filter((item) => item.body.type === 'clock' && item.body.op !== 'set');
-    if (pendingClock.length) return pendingClock.at(-1).body.op === 'start';
+    const stopsOrStarts = (body) => (body.type === 'clock' && body.op !== 'set') || (body.type === 'timeout' && body.op === 'call');
+    const pendingClock = queue.pendingFor(this.id).filter((item) => stopsOrStarts(item.body));
+    if (pendingClock.length) {
+      const last = pendingClock.at(-1).body;
+      return last.type === 'clock' && last.op === 'start';
+    }
     return Boolean(this.game.clock?.running);
   }
 
@@ -1160,6 +1478,11 @@ class ConsoleView {
     let running = Boolean(this.game.clock?.running);
     let held = null;
     for (const { body, meta } of queue.pendingFor(this.id)) {
+      if (body.type === 'timeout' && body.op === 'call') {
+        if (running) held = Number.isFinite(body.remainingMs) ? body.remainingMs : null;
+        running = false;
+        continue;
+      }
       if (body.type !== 'clock') continue;
       if (body.op === 'start') {
         running = true;
@@ -1515,3 +1838,9 @@ async function main() {
 }
 
 main();
+
+// "Jordan Smith" → "Smith": what fits on a player chip.
+function shortName(name) {
+  const words = name.trim().split(/\s+/);
+  return words.length > 1 ? words.at(-1) : name;
+}

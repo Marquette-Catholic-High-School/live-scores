@@ -100,7 +100,10 @@ describe('push flows (fake APNs)', () => {
       const state = aps['content-state'];
       assert.deepEqual(
         { ...state, updatedAt: 0 },
-        { status: 'live', homeScore: 0, awayScore: 0, periodLabel: '1st Quarter', periodShort: 'Q1', note: '', clockRemaining: 480, updatedAt: 0 },
+        {
+          status: 'live', homeScore: 0, awayScore: 0, periodLabel: '1st Quarter', periodShort: 'Q1', note: '', clockRemaining: 480,
+          homeFouls: 0, awayFouls: 0, homeBonus: false, awayBonus: false, updatedAt: 0,
+        },
       );
       assert.ok(Math.abs(state.updatedAt - nowSec) <= 2);
       assert.ok(Buffer.byteLength(JSON.stringify({ a: aps.attributes, c: state })) < 1024);

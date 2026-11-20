@@ -86,7 +86,12 @@ describe('RTD reader', () => {
     const text = block([[1, ' 4:32'], [28, ' '], [108, '  56'], [112, '  48'], [142, ' 3'], [184, '1101']]);
     const reader = new RtdReader();
     reader.push(encodeFrame(0, text));
-    assert.deepEqual(reader.reading('basketball'), { clockMs: 272_000, clockRunning: true, home: 56, away: 48, period: 3, sportCode: 1101 });
+    assert.deepEqual(reader.reading('basketball'), {
+      clockMs: 272_000, clockRunning: true, home: 56, away: 48, period: 3, sportCode: 1101,
+      // Blank in this block: no team fouls or timeouts shown, no indicator lit.
+      homeFouls: null, awayFouls: null, homeTimeoutsLeft: null, awayTimeoutsLeft: null,
+      homeBonus: false, awayBonus: false, homeTimeout: false, awayTimeout: false,
+    });
   });
 
   it('reads volleyball points, game number and finished games', () => {

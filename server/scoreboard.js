@@ -19,7 +19,7 @@ import net from 'node:net';
 import { badRequest } from './errors.js';
 import { CONSOLE_RESET_REASON, FINAL_HORN_REASON, computeScores, gameLabel, lastPeriodIndex, overOnScoreboard } from './games.js';
 import { getSport } from './sports.js';
-import { RtdReader } from './rtd.js';
+import { BOX_READING_KEYS, RtdReader } from './rtd.js';
 import { UdpListeners } from './scoreboard-udp.js';
 
 export const SCOREBOARD_SPORTS = Object.freeze(['basketball', 'volleyball']);
@@ -984,6 +984,8 @@ export class ScoreboardService {
       reading.period = null;
       reading.home = null;
       reading.away = null;
+      // The box (§13) still shows the game before too.
+      for (const key of BOX_READING_KEYS) if (key in reading) reading[key] = null;
     }
     if (held === feed.previousGame) return;
     feed.previousGame = held;

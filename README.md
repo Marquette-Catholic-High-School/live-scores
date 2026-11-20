@@ -528,7 +528,8 @@ elsewhere without a code change with the launch argument
    seconds a Live Activity appears on every iPhone with the MCHS app and Live Activities
    on - they are on by default; people who don't want them turn **Live Activities** off
    in the app's notification settings (and iOS must allow Live Activities for the app).
-4. **Score**: every tap (points, period, clock, outs, notes, undo) updates the
+4. **Score**: every tap (points, period, clock, outs, notes, undo; for basketball also
+   fouls, timeouts and which player scored, section 8.3) updates the
    portal scoreboard and the app instantly; Lock Screens update within a few seconds
    (updates are combined to at most one every 5 s per game to stay within Apple's
    push budget).
@@ -762,6 +763,37 @@ If the station's address or short name changes, set `RADIO_URL` / `RADIO_STATION
 the same file (`RADIO_URL="off"` turns the radio off). `RADIO_STREAM_URL` is the stream
 the app plays; by default `https://radio.marquettenation.com/listen/marquette_nation_sports/radio.mp3`.
 
+### 8.3 Basketball box score: rosters, fouls, bonus, timeouts
+
+Basketball games keep a box score: each player's points and personal fouls, the team
+fouls of the quarter, the bonus, and timeouts. The portal's game page, the app's game
+screen and the Live Activity show them. Details: ARCHITECTURE.md §13.
+
+* **Rosters**: in the scoring console, open **Rosters** (it's open before the game).
+  Type each team's players, a number and a full name, and **Add**. You can add and fix
+  players during the game too. Rosters are typed in for each game.
+* **Who scored**: tap the player on the team's pad (#23 Smith), then +1/+2/+3. Without a
+  player the points count for the team only (the box score shows them as not credited
+  to a player). **−1 Fix** with a player picked takes a point back from them.
+* **Fouls**: tap the player, then **Foul**: a personal foul and a team foul. **Foul**
+  without a player is a team foul only; **−1** takes one back. A player is marked fouled
+  out at 5 fouls.
+* **Bonus**: shown on the team that shoots, from the opponent's 5th team foul of the
+  quarter (NFHS: fouls reset each quarter; overtime continues the 4th quarter's count).
+* **Timeouts**: **Timeout** on the team's pad (it shows how many are left) stops the
+  clock and shows *Timeout · MCHS* on the scoreboard, in the app and on Lock Screens.
+  It ends when you start the clock (or tap **End timeout**). Each team gets 5 a game plus
+  1 per overtime; change the number per game under **Timeouts** in the game form.
+* **Mistakes**: **Undo last change** undoes fouls, timeouts and player points too.
+* **Games on the gym scoreboard (8.1)**: the scoreboard keeps the score, team fouls,
+  timeouts left, bonus and the timeout in progress. You only credit the players: tap a
+  player, then their points or **Foul** (the points buttons wait for a player).
+  *Check this on the first game night*: System → Scoreboard → **Test connection** shows
+  the team fouls, timeouts left, bonus and timeout the server reads from the board;
+  they must match what the board shows. Their positions in the scoreboard's data come
+  from an open-source decoder, not from Daktronics, so if one is off, tell whoever
+  maintains the server: it's a one-line fix in `server/rtd.js`.
+
 ## 9. Verify APNs
 
 ```bash
@@ -816,10 +848,10 @@ Things to know:
   with their defaults, e.g. `SCHOOL_TIMEZONE` (`America/Chicago`, or what you enter at
   the prompt / pass with `--school-timezone`) and the capacity keys. Its output line
   `Updated /etc/mchs-live/mchs-live.env: …` lists what changed.
-* The server updates the database schema by itself when it starts (now version 5:
+* The server updates the database schema by itself when it starts (now version 6:
   version 2 added the tables that let pushes survive a restart, version 3 the scoreboard
   settings of section 8.1, version 4 a game's Boys/Girls and level, version 5 a game's
-  radio switch of section 8.2). An older server refuses a database
+  radio switch of section 8.2, version 6 the basketball box score of section 8.3). An older server refuses a database
   a newer one has updated ("schema version … is newer than this server"): to go back to
   an older version, re-run its installer (it stops because the server doesn't start),
   then `sudo mchs-live-restore` the `-pre-upgrade` backup taken before the upgrade

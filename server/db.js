@@ -165,6 +165,14 @@ const MIGRATIONS = [
   ALTER TABLE games ADD COLUMN radio INTEGER NOT NULL DEFAULT 0;
   CREATE INDEX games_radio ON games(status) WHERE radio = 1;
   `,
+  // 6: the box score (§13, basketball): roster = the players the
+  // scorekeeper typed in, {home: [{id, number, name}], away: [...]}; box =
+  // what they did and the team counts, {players: {<id>: {points, fouls}},
+  // fouls: [{home, away}] per period, timeoutsLeft, timeout, boardBonus}.
+  `
+  ALTER TABLE games ADD COLUMN roster TEXT NOT NULL DEFAULT '{"home":[],"away":[]}';
+  ALTER TABLE games ADD COLUMN box TEXT NOT NULL DEFAULT '{}';
+  `,
 ];
 
 export class Database {

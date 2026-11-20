@@ -4,7 +4,7 @@
 
 import { api, fetchConfig } from './api.js';
 import { clockRemainingMs, formatClock, onTick, serverNow } from './clock.js';
-import { finalLabel, hasStarted, isHalfInnings, isSetsMode, leader, updateTeamChip } from './render.js';
+import { displayNote, finalLabel, hasStarted, isHalfInnings, isSetsMode, leader, updateTeamChip } from './render.js';
 import { GameStore, coalesce } from './store.js';
 import { connectStream } from './sse.js';
 import {
@@ -123,7 +123,12 @@ class GameCard {
       if (game.outs !== null && game.outs !== undefined) {
         items.push(el('span', { class: 'game-card__detail', text: `${isHalfInnings(game.rules) ? game.periodLabel : game.periodShort} · ${game.outs} ${game.outs === 1 ? 'out' : 'outs'}` }));
       }
-      if (game.note) items.push(el('span', { class: 'note-pill', text: game.note }));
+      // Basketball (§13): which team is in the bonus.
+      for (const side of ['home', 'away']) {
+        if (game.box?.bonus[side]) items.push(el('span', { class: 'bonus-badge', text: `${game[side].code} bonus`, title: `${game[side].name} is in the bonus` }));
+      }
+      const note = displayNote(game);
+      if (note) items.push(el('span', { class: ['note-pill', game.box?.timeout && 'note-pill--timeout'], text: note }));
     } else if (game.status !== 'scheduled') {
       items.push(el('span', { text: formatDay(game.endedAt ?? game.scheduledAt) }));
     }

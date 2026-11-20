@@ -255,3 +255,76 @@ export function lineScoreTable(game) {
   );
   return el('div', { class: 'linescore-wrap' }, table);
 }
+
+// ---- box score (ARCHITECTURE.md §13, basketball) -----------------------------
+
+// "Timeout · MCHS" while a team's timeout is on, otherwise the note.
+export function displayNote(game) {
+  if (game.status === 'live' && game.box?.timeout) return `Timeout · ${game[game.box.timeout].code}`;
+  return game.note ?? '';
+}
+
+// One team's fouls this quarter, bonus and timeouts left, as a short line
+// under its score. Null for sports without a box score.
+export function teamStats(game, side, { compact = false } = {}) {
+  const box = game.box;
+  if (!box) return null;
+  const left = box.timeoutsLeft[side];
+  return el(
+    'span',
+    { class: 'team-stats' },
+    el('span', { class: 'team-stats__item', text: `${box.fouls[side]} ${box.fouls[side] === 1 ? 'foul' : 'fouls'}` }),
+    el('span', { class: 'team-stats__item', text: compact ? `${left} TO` : `${left} ${left === 1 ? 'timeout' : 'timeouts'} left` }),
+    box.bonus[side] ? el('span', { class: 'bonus-badge', text: 'Bonus', title: `${game[side].name} is in the bonus` }) : null,
+  );
+}
+
+// Both teams' players with their points and personal fouls, or null when no
+// roster was entered.
+export function boxScore(game) {
+  const box = game.box;
+  if (!box || SIDES.every((side) => box.players[side].length === 0)) return null;
+  return el('div', { class: 'boxscore' }, SIDES.map((side) => boxScoreTable(game, side)));
+}
+
+function boxScoreTable(game, side) {
+  const team = game[side];
+  const players = game.box.players[side];
+  const fouls = players.reduce((sum, player) => sum + player.fouls, 0);
+  const tagged = players.reduce((sum, player) => sum + player.points, 0);
+  const body = players.length
+    ? players.map((player) => el(
+      'tr',
+      { class: player.fouledOut && 'is-out' },
+      el('td', { class: 'boxscore__number', text: player.number }),
+      el('th', { scope: 'row', class: 'boxscore__name' }, player.name, player.fouledOut ? el('span', { class: 'boxscore__out', text: 'Fouled out' }) : null),
+      el('td', { class: 'num', text: String(player.points) }),
+      el('td', { class: 'num', text: String(player.fouls) }),
+    ))
+    : [el('tr', {}, el('td', { colspan: 4, class: 'boxscore__empty', text: 'No roster entered.' }))];
+  // Points scored without a player picked count for the team only.
+  const untagged = team.score - tagged;
+  return el(
+    'div',
+    { class: 'table-wrap boxscore__team' },
+    el('div', { class: 'boxscore__head', 'aria-hidden': 'true' }, teamChip(team), el('span', { text: team.name })),
+    el(
+      'table',
+      { class: 'table boxscore__table' },
+      el('caption', { class: 'sr-only', text: `${team.name} box score` }),
+      el('thead', {}, el('tr', {},
+        el('th', { scope: 'col', class: 'boxscore__number' }, el('abbr', { title: 'Number', text: '#' })),
+        el('th', { scope: 'col', text: 'Player' }),
+        el('th', { scope: 'col', class: 'num' }, el('abbr', { title: 'Points', text: 'Pts' })),
+        el('th', { scope: 'col', class: 'num' }, el('abbr', { title: 'Personal fouls', text: 'PF' })))),
+      el('tbody', {}, body),
+      players.length
+        ? el('tfoot', {}, el('tr', {},
+          el('td', {}),
+          el('th', { scope: 'row', text: untagged > 0 ? `Team (${untagged} not credited to a player)` : 'Team' }),
+          el('td', { class: 'num', text: String(team.score) }),
+          el('td', { class: 'num', text: String(fouls) })))
+        : null,
+    ),
+  );
+}

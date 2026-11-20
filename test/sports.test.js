@@ -66,9 +66,11 @@ describe('sports', () => {
   });
 
   it('has defaults per sport', () => {
-    assert.deepEqual(defaultOptions('basketball'), { clockEnabled: true, periodMinutes: 8, overtimeMinutes: 4, bestOf: null });
-    assert.deepEqual(defaultOptions('volleyball'), { clockEnabled: false, periodMinutes: null, overtimeMinutes: null, bestOf: 3 });
-    assert.deepEqual(defaultOptions('baseball'), { clockEnabled: false, periodMinutes: null, overtimeMinutes: null, bestOf: null });
+    assert.deepEqual(defaultOptions('basketball'), { clockEnabled: true, periodMinutes: 8, overtimeMinutes: 4, bestOf: null, timeouts: 5 });
+    assert.deepEqual(defaultOptions('volleyball'), { clockEnabled: false, periodMinutes: null, overtimeMinutes: null, bestOf: 3, timeouts: null });
+    assert.deepEqual(defaultOptions('baseball'), { clockEnabled: false, periodMinutes: null, overtimeMinutes: null, bestOf: null, timeouts: null });
+    assert.deepEqual(rulesFor('basketball').box, { bonusFouls: 5, foulOut: 5, timeouts: 5, overtimeTimeouts: 1 });
+    assert.equal(rulesFor('soccer').box, undefined, 'only basketball keeps a box score');
   });
 
   it('exposes every sport with its id', () => {

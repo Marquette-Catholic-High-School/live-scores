@@ -355,6 +355,15 @@ function gameFormDialog(game = null) {
       );
       const bestOf = select(BEST_OF.map((n) => [String(n), `Best of ${n} sets`]));
       const setsSet = el('fieldset', { class: 'fieldset' }, el('legend', { text: 'Match format' }), field('Sets', bestOf));
+      // Basketball's box score (ARCHITECTURE.md §13): timeouts per team.
+      const timeouts = numberInput({ min: 0, max: 10, required: true });
+      const timeoutsHint = el('span', { class: 'field__hint' });
+      const timeoutsSet = el(
+        'fieldset',
+        { class: 'fieldset' },
+        el('legend', { text: 'Timeouts' }),
+        el('label', { class: 'field' }, el('span', { class: 'field__label', text: 'Timeouts per team' }), timeouts, timeoutsHint),
+      );
 
       // Hidden fields (a sport without a clock or without overtime) are
       // disabled too: a required field the admin can't see would otherwise
@@ -382,6 +391,13 @@ function gameFormDialog(game = null) {
         const sets = rules.scoreMode === 'sets';
         setsSet.hidden = !sets;
         if (sets) bestOf.value = String(options?.bestOf ?? rules.defaults?.bestOf ?? BEST_OF[0]);
+        timeoutsSet.hidden = !rules.box;
+        timeouts.disabled = !rules.box;
+        if (rules.box) {
+          timeouts.value = String(options?.timeouts ?? rules.box.timeouts);
+          const extra = rules.box.overtimeTimeouts;
+          timeoutsHint.textContent = extra > 0 ? `For the whole game, plus ${extra} more in each overtime.` : 'For the whole game.';
+        }
       };
       applySport({ keepGameOptions: true });
       sport.addEventListener('change', () => applySport({ keepGameOptions: sport.value === game?.sport }));
@@ -493,6 +509,7 @@ function gameFormDialog(game = null) {
         away.root,
         clockSet,
         setsSet,
+        timeoutsSet,
         feedSet,
         radioSet,
         error,
@@ -530,6 +547,7 @@ function gameFormDialog(game = null) {
           }
         }
         if (rules.scoreMode === 'sets') payload.options.bestOf = Number(bestOf.value);
+        if (rules.box) payload.options.timeouts = Number(timeouts.value);
         if (!feedSet.hidden && (!editing || feedValue() !== shownFeed)) payload.scoreboard = feedValue();
         if (radioSet && (!editing || radioOn.checked !== Boolean(game.radio))) payload.radio = radioOn.checked;
 
@@ -1131,12 +1149,25 @@ function scoreboardReading(reading) {
   const code = reading.sportCode;
   const sport = code === null ? null : code >= 1000 && code < 2000 ? 'Basketball' : code >= 2000 && code < 3000 ? 'Volleyball' : `Other (code ${code})`;
   const running = reading.clockRunning === null ? '' : reading.clockRunning ? ', running' : ', stopped';
-  return keyValues([
+  const rows = [
     ['Clock', reading.clockMs === null ? notYet : `${formatClock(reading.clockMs)}${running}`],
     ['Score', reading.home === null && reading.away === null ? notYet : `Home ${reading.home ?? '—'}, guest ${reading.away ?? '—'}`],
     [sport === 'Volleyball' ? 'Set' : sport === 'Basketball' ? 'Period' : 'Period or set', reading.period === null ? notYet : String(reading.period)],
     ['Sport', sport ?? 'Not known yet (sent when the clock stops)'],
-  ]);
+  ];
+  // Basketball's box score fields (§13), to check against what the board
+  // shows: their positions in the data aren't confirmed by Daktronics.
+  if ('homeFouls' in reading && sport !== 'Volleyball') {
+    const pair = (home, away) => (home === null && away === null ? notYet : `Home ${home ?? '—'}, guest ${away ?? '—'}`);
+    const lit = (home, away) => (home === null && away === null ? notYet : [home && 'Home', away && 'Guest'].filter(Boolean).join(' and ') || 'Neither');
+    rows.push(
+      ['Team fouls', pair(reading.homeFouls, reading.awayFouls)],
+      ['Timeouts left', pair(reading.homeTimeoutsLeft, reading.awayTimeoutsLeft)],
+      ['Bonus', lit(reading.homeBonus, reading.awayBonus)],
+      ['Timeout on', lit(reading.homeTimeout, reading.awayTimeout)],
+    );
+  }
+  return keyValues(rows);
 }
 
 // "12 ms", "5 seconds", "3 minutes", "2 hours": how long a test (or a live

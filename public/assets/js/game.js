@@ -4,7 +4,8 @@
 import { ApiError, api, fetchConfig, gameApiPath } from './api.js';
 import { clockRemainingMs, formatClock, onTick, serverNow } from './clock.js';
 import {
-  finalLabel, hasStarted, isSetsMode, leader, lineScoreTable, matchup, outsIndicator, scoreLine, setsToWin, statusLabel,
+  boxScore, displayNote, finalLabel, hasStarted, isSetsMode, leader, lineScoreTable, matchup, outsIndicator, scoreLine, setsToWin, statusLabel,
+  teamStats,
 } from './render.js';
 import { connectStream } from './sse.js';
 import {
@@ -43,6 +44,8 @@ function teamPanel(side) {
   const value = el('span', { class: 'board__value' });
   const score = el('span', { class: 'board__score', 'aria-live': 'polite', 'aria-atomic': 'true' }, label, value);
   const sub = el('span', { class: 'board__sub' });
+  // Basketball (§13): fouls this quarter, timeouts left, bonus.
+  const stats = el('span', { class: 'board__stats' });
   const root = el(
     'section',
     { class: 'board__team', dataset: { side }, 'aria-label': side === 'home' ? 'Home team' : 'Away team' },
@@ -51,8 +54,9 @@ function teamPanel(side) {
     name,
     score,
     sub,
+    stats,
   );
-  return { root, code, name, label, value, score, sub };
+  return { root, code, name, label, value, score, sub, stats };
 }
 
 function setPips(node, won, needed) {
@@ -74,6 +78,7 @@ function buildBoard() {
   const away = teamPanel('away');
   const mid = el('div', { class: 'board__mid' }, status, period, clock, outs.root, note, countdown);
   const line = el('div', { class: 'board__line' });
+  const box = el('div', { class: 'board__box' });
   const updated = el('p', { class: 'board__updated' });
   const root = el(
     'article',
@@ -81,9 +86,10 @@ function buildBoard() {
     el('header', { class: 'board__meta' }, sport, where),
     el('div', { class: 'board__main' }, home.root, mid, away.root),
     line,
+    box,
     updated,
   );
-  return { root, sport, where, status, period, clock, outs, note, countdown, teams: { home, away }, line, updated, lineKey: '' };
+  return { root, sport, where, status, period, clock, outs, note, countdown, teams: { home, away }, line, box, updated, lineKey: '' };
 }
 
 function render(previous) {
@@ -118,6 +124,9 @@ function render(previous) {
     if (sets && started) setPips(panel.sub, team.score, setsToWin(game));
     else panel.sub.replaceChildren();
     panel.sub.hidden = !(sets && started);
+    const stats = live ? teamStats(game, side) : null;
+    panel.stats.replaceChildren(...(stats ? [stats] : []));
+    panel.stats.hidden = !stats;
     if (previous && started && (previous[side].score !== team.score || previous[side].setScore !== team.setScore)) {
       replayClass(panel.value, 'is-bumped');
     }
@@ -132,16 +141,21 @@ function render(previous) {
   board.clock.classList.toggle('is-stopped', Boolean(game.clock && !game.clock.running));
   board.outs.root.hidden = !(live && game.outs !== null && game.outs !== undefined);
   if (!board.outs.root.hidden) board.outs.update(game.outs);
-  board.note.textContent = game.note;
-  board.note.hidden = !(live && game.note);
+  const note = displayNote(game);
+  board.note.textContent = note;
+  board.note.hidden = !(live && note);
+  board.note.classList.toggle('note-pill--timeout', Boolean(live && game.box?.timeout));
   board.countdown.hidden = game.status !== 'scheduled';
 
   const lineKey = JSON.stringify([game.version, game.status]);
   if (started && lineKey !== board.lineKey) {
     board.line.replaceChildren(lineScoreTable(game));
+    const box = boxScore(game);
+    board.box.replaceChildren(...(box ? [box] : []));
     board.lineKey = lineKey;
   }
   board.line.hidden = !started;
+  board.box.hidden = !started || board.box.childElementCount === 0;
   board.updated.textContent = live ? `Updated ${formatTime(game.updatedAt)}` : '';
 
   document.title = titleFor(game);

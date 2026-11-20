@@ -198,6 +198,60 @@ describe('Daktronics scoreboard feed', () => {
     await waitFor(() => board.open === 0, { message: 'disconnects after the game' });
   });
 
+  it('takes team fouls, timeouts left, bonus and the timeout from the board; players are tagged by hand (§13)', async () => {
+    const game = await createGame(admin, { scheduledAt: Date.now() + AHEAD });
+    await keeper.post(`/api/games/${game.id}/claim`, {});
+    const added = await act(keeper, game.id, { type: 'roster', op: 'add', team: 'home', number: '23', name: 'Jordan Smith' });
+    const smith = added.json.game.box.players.home[0].id;
+    await startGame(keeper, game.id);
+    await waitFor(() => board.open === 1, { message: 'feed connects' });
+
+    const field = (name, value) => encodeField(...FIELDS[name], value, { right: true });
+    const flags = ({ homeBonus = ' ', guestBonus = ' ', homeTimeout = ' ', guestTimeout = ' ' } = {}) => [
+      field('homeBonus', homeBonus), field('homeBonusTwo', ' '), field('guestBonus', guestBonus), field('guestBonusTwo', ' '),
+      field('homeTimeoutOn', homeTimeout), field('guestTimeoutOn', guestTimeout),
+    ];
+    board.send(...score(0, 0), period(1), clockFrame('8:00', { running: false }), field('homeFouls', 0), field('guestFouls', 0), ...flags());
+    let live = await waitForGame(keeper, game.id, (g) => g.scoreboard.state === 'receiving', 'receiving');
+
+    board.send(field('homeFouls', 2), field('guestFouls', 5), field('homeTimeoutsLeft', 4), field('guestTimeoutsLeft', 5), ...flags({ homeBonus: '<', homeTimeout: '<' }));
+    live = await waitForGame(keeper, game.id, (g) => g.box.fouls.away === 5 && g.box.timeout === 'home', 'box from the board');
+    assert.deepEqual(live.box.fouls, { home: 2, away: 5 });
+    assert.deepEqual(live.box.timeoutsLeft, { home: 4, away: 5 });
+    assert.deepEqual(live.box.bonus, { home: true, away: false }, "the board's bonus indicators");
+
+    // The scorekeeper tags players; the board keeps the team counts.
+    const foul = await act(keeper, game.id, { type: 'foul', team: 'home', player: smith });
+    assert.equal(foul.status, 200, foul.text);
+    assert.deepEqual([foul.json.game.box.players.home[0].fouls, foul.json.game.box.fouls.home], [1, 2], "a player's foul; the team count stays the board's");
+    assert.equal((await act(keeper, game.id, { type: 'foul', team: 'home' })).status, 409, 'team fouls come from the board');
+    const timeout = await act(keeper, game.id, { type: 'timeout', team: 'away' });
+    assert.equal(timeout.json.error.code, 'scoreboard_active', 'timeouts come from the board');
+    const points = await act(keeper, game.id, { type: 'player_points', team: 'home', player: smith, points: 2 });
+    assert.equal(points.status, 200);
+    assert.equal(points.json.game.box.players.home[0].points, 2);
+
+    // The timeout ends on the board; fouls reset with the quarter.
+    board.send(...flags({ homeBonus: '<' }), clockFrame('7:59', { running: true }));
+    live = await waitForGame(keeper, game.id, (g) => g.box.timeout === null && g.clock.running, 'timeout over');
+    board.send(period(2), field('homeFouls', 0), field('guestFouls', 0), ...flags());
+    live = await waitForGame(keeper, game.id, (g) => g.period === 1 && g.box.fouls.away === 0, 'quarter 2');
+    assert.deepEqual(live.box.bonus, { home: false, away: false });
+    assert.equal(live.box.players.home[0].fouls, 1, "players' fouls carry over");
+
+    // Scored by hand from here: fouls are counted by hand, the bonus from them.
+    board.send(field('guestFouls', 5), ...flags({ homeBonus: '<' }));
+    await waitForGame(keeper, game.id, (g) => g.box.bonus.home, "the board's bonus");
+    const manual = await keeper.post(`/api/games/${game.id}/scoreboard`, { manual: true });
+    assert.deepEqual(manual.json.game.box.bonus, { home: true, away: false }, 'the 5 fouls the board counted still give the bonus');
+    const takeBack = await act(keeper, game.id, { type: 'foul', team: 'away', delta: -1 });
+    assert.equal(takeBack.status, 200, takeBack.text);
+    assert.deepEqual([takeBack.json.game.box.fouls.away, takeBack.json.game.box.bonus.home], [4, false], 'by hand, the bonus follows the fouls');
+
+    assert.equal((await keeper.post(`/api/games/${game.id}/end`, {})).status, 200);
+    await waitFor(() => board.open === 0, { message: 'disconnects after the game' });
+  });
+
   it('only drives basketball and volleyball games with the school at home', async () => {
     const away = await createGame(admin, { scheduledAt: Date.now() + AHEAD, home: { name: 'Lincoln', code: 'LIN', color: '#B22234' }, away: { name: 'Marquette', code: 'MAR', color: '#12214D' } });
     const football = await createGame(admin, { scheduledAt: Date.now() + AHEAD, sport: 'football' });

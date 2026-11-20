@@ -28,6 +28,9 @@ them drift.
 7. **The radio** (§12): an admin switches a game **on the radio**. While the school's
    AzuraCast station has a broadcaster live, the app shows **Listen Live** on that game;
    when the station goes live, every iPhone subscribed to the radio topic gets a notification.
+8. **The box score** (§13, basketball): the scorekeeper types in both rosters and credits
+   each basket and foul to a player; the portal, the app and the Live Activity show team
+   fouls, the bonus and timeouts (from the gym scoreboard for games it drives).
 
 Firebase is **not** used by any part of this system, with one exception: the "the radio
 is live" notification (§12) is sent through Firebase Cloud Messaging to a topic, because
@@ -179,7 +182,10 @@ games(
   scoreboard_manual INTEGER NOT NULL DEFAULT 0, -- schema 3, §11: 1 = the scorekeeper scores this game by hand
   gender TEXT,                       -- schema 4, §6: 'boys' | 'girls' | NULL (not set)
   level TEXT,                        -- schema 4, §6: 'varsity' | 'jv' | 'freshman' | NULL (not set)
-  radio INTEGER NOT NULL DEFAULT 0   -- schema 5, §12: 1 = an admin switched the game on the radio
+  radio INTEGER NOT NULL DEFAULT 0,  -- schema 5, §12: 1 = an admin switched the game on the radio
+  roster TEXT NOT NULL DEFAULT '{"home":[],"away":[]}',  -- schema 6, §13: [{id, number, name}] per team
+  box TEXT NOT NULL DEFAULT '{}'     -- schema 6, §13: {players: {<id>: {points, fouls}}, fouls: [{home, away}] per period,
+                                     --   timeoutsLeft: {home, away} | null, timeout: 'home' | 'away' | null, boardBonus}
 )
 game_events(
   id INTEGER PRIMARY KEY,
@@ -227,10 +233,11 @@ settings(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)
                                                     -- §12: 'radio.lastLiveAt', 'radio.lastNotifiedAt' (unix ms)
 ```
 
-The schema version is `PRAGMA user_version` (currently **5**). Migrations run at startup,
+The schema version is `PRAGMA user_version` (currently **6**). Migrations run at startup,
 each in one transaction; migration 2 also queues the channels of games that had already
 ended for deletion; migration 4 adds `gender` and `level` (NULL for existing games);
-migration 5 adds `radio` (0 for existing games) and the partial index `games_radio`. A database with a newer version than the server knows is refused
+migration 5 adds `radio` (0 for existing games) and the partial index `games_radio`;
+migration 6 adds `roster` and `box` (empty for existing games, §13). A database with a newer version than the server knows is refused
 (an older server can't open a database a newer one has migrated).
 
 Keep only the last 30 days of `push_log`; delete sessions after expiry; devices
@@ -344,9 +351,17 @@ length, **stopped**. A period with 0 minutes has no clock (`clock_ms = NULL`).
   "outs": null,                           // number for baseball, else null
   "note": "",
   "clock": { "running": true, "remainingMs": 312000, "anchorAt": 1793571000000, "periodMs": 480000 },  // or null
-  "options": { "clockEnabled": true, "periodMinutes": 8, "overtimeMinutes": 4, "bestOf": null },
+  "options": { "clockEnabled": true, "periodMinutes": 8, "overtimeMinutes": 4, "bestOf": null, "timeouts": 5 },  // timeouts: §13, null without a box score
   "rules": { /* the SPORTS entry for this sport (incl. overtime.naming), with volleyball periods expanded for this game's bestOf */ },
   "radio": true,                          // §12: an admin switched it on the radio (Listen Live shows only while the station is live and carries it)
+  "box": {                                // §13, basketball only (null for other sports)
+    "players": { "home": [ { "id": "p1x9k2", "number": "23", "name": "Jordan Smith", "points": 12, "fouls": 3, "fouledOut": false } ],
+                 "away": [ … ] },         // roster order; number is text ("0"–"99", "00")
+    "fouls": { "home": 4, "away": 5 },   // team fouls that count now: this quarter (overtime continues the 4th)
+    "bonus": { "home": true, "away": false },   // home: the home team shoots bonus free throws
+    "timeoutsLeft": { "home": 3, "away": 4 },
+    "timeout": "home"                     // the team whose timeout is on, else null (always null unless live)
+  },
   "scorekeeper": { "id": 3, "name": "Coach Smith" },   // null if unclaimed; only included for authenticated viewers, otherwise omitted
   "scoreboard": { "setting": "default", "custom": null, "address": "10.20.1.50:10001", "eligible": true, "manual": false,
                   "controlling": true, "state": "receiving", "message": "Score, clock and period come from the scoreboard.",
@@ -454,7 +469,8 @@ Codes used: `bad_request` 400, `unauthorized` 401, `forbidden` 403, `not_found` 
       state unchanged (re-anchors). Non-integral `remainingMs` is rounded.
     * `outs` `{ delta: 1 | -1 }` — baseball only (400 for other sports); see §5.
     * `note` `{ text: string }` — ≤ 40 chars after trim; `""` clears.
-    * `undo` `{}` — reverts the most recent not-undone scoring event of this game (`score`, `set_score`, `period`, `clock`, `outs`, `note`) by restoring its `prev_state`; 409 if nothing to undo (or that period no longer exists after an options edit). Never reaches past a scoreboard update (§11): only events after the last one can be undone.
+    * `undo` `{}` — reverts the most recent not-undone scoring event of this game (`score`, `set_score`, `period`, `clock`, `outs`, `note`, `player_points`, `foul`, `timeout`) by restoring its `prev_state`; 409 if nothing to undo (or that period no longer exists after an options edit). Never reaches past a scoreboard update (§11): only events after the last one can be undone.
+    * Box score (§13, basketball only: 400 for other sports): `score` takes an optional `player` (a roster id of that team: the points count for the player too); `player_points`, `foul`, `timeout` and `roster`. `roster` is also allowed while the game is `scheduled`, and is never undone.
   * While the scoreboard drives the game (§11, `scoreboard.controlling`), `score`, `set_score`, `period`, `clock` and `undo` → 409 `scoreboard_active`. Notes stay manual.
   * Every applied action: `version+1`, `updated_at=now`, insert `game_events`, emit SSE `game`, schedule an APNs update when the Lock Screen content changed (§8.2).
 * `POST /api/games/:id/end` → `{ game }` — holder or admin; `live` → `final` (409 otherwise), clock stopped, `note` cleared, `endedAt=now`, end push flow (§8).
@@ -664,9 +680,13 @@ the devices it hasn't reached), not the ones already on Lock Screens.
   "clockRemaining": 312.0,     // seconds remaining at updatedAt; null/omitted = no clock
   "clockEndsAt": 1793571312.0, // unix SECONDS when a RUNNING clock reaches 0:00; null/omitted when stopped
   "outs": null,                // baseball 0–2, else null/omitted
+  "homeFouls": 4, "awayFouls": 5,         // §13 basketball: team fouls this quarter (omitted otherwise)
+  "homeBonus": true, "awayBonus": false,  // §13 basketball: in the bonus (omitted otherwise)
   "updatedAt": 1793571000.0    // unix seconds
 }
 ```
+* While a team's timeout is on (§13), `note` is `"Timeout · <team code>"` (e.g.
+  `"Timeout · MCHS"`), so every app version shows it where it shows notes.
 * Times are **plain Unix seconds as JSON numbers** and the Swift properties are
   `Double`, never `Date` (ActivityKit's decoder would treat a `Date` as seconds
   since 2001).
@@ -1086,3 +1106,97 @@ itself and a streamer/DJ account for each broadcaster.
   (2 s, 10 s). Each notification is a `push_log` row (`kind` `radio`, no environment).
   Without `FCM_SERVICE_ACCOUNT_PATH` the radio works and the row says why nothing was sent.
 
+
+## 13. Box score (basketball)
+
+Basketball games keep a box score: each team's roster as the scorekeeper typed it in
+(both teams, number and full name), every player's points and personal fouls, team
+fouls per quarter, the bonus, and team timeouts. Other sports have none (`box: null`).
+The code is `server/box.js`; the rules are the sport's `rules.box`
+(`server/sports.js`).
+
+**Rules (NFHS, which IHSA plays):**
+* **Team fouls** count per quarter and reset each quarter. Overtime continues the 4th
+  quarter's count.
+* A team is **in the bonus** (two shots) at the opponent's 5th team foul of the quarter
+  (`bonusFouls`). There is no one-and-one and no double bonus.
+* **Foul out:** a player is marked fouled out at 5 personal fouls (`foulOut`).
+* **Timeouts:** 5 per team a game (`timeouts`, changeable per game as
+  `options.timeouts`, 0–10), plus 1 for each overtime (`overtimeTimeouts`).
+
+**Storage** (schema 6): `roster` holds identities only; `box` holds what they did and
+the team counts. The player id is 6 random characters, unique within the game; numbers
+are unique per team. The `box` is part of every action's `prev_state`, so `undo`
+restores stats. `roster` is not, so an undo never removes a player added since.
+
+**Actions** (`POST /api/games/:id/actions`, holder or admin):
+* `roster` `{ op: "add", team, number, name }` | `{ op: "edit", team, player, number?, name? }` | `{ op: "remove", team, player }`
+  * Allowed while `scheduled` or `live`; never undone. Validated as follows:
+    * `number`: text `"0"`–`"99"` (`"00"` allowed), unique per team (409).
+    * `name`: 1–40 characters.
+    * At most 30 players a team.
+  * Removing a player who has points or fouls is refused (409): edit them instead.
+* `score` `{ team, points, player? }`: as before, and the points also count for the
+  player.
+* `player_points` `{ team, player, points }`: the player's points only (±1–10, ≠ 0;
+  can't go below 0). The team score stays as it is, because the scoreboard keeps it or
+  the points were already counted for the team.
+* `foul` `{ team, player?, delta: 1 | -1 }` (default 1): changes the player's fouls and
+  the team's fouls for the current period. Neither can go below 0.
+* `timeout` `{ op: "call", team, remainingMs? }` | `{ op: "end" }`
+  * A call takes one of the team's timeouts (409 at 0, or if that team's timeout is
+    already on), sets `timeout`, and stops a running clock.
+  * `remainingMs` is the time the scorekeeper saw, honored as for `clock` `stop`.
+  * The timeout ends when the clock starts, the period changes, the game ends, or with
+    `end`.
+* A period step also extends `box.fouls` like `line`. Each overtime adds
+  `overtimeTimeouts` to both teams' timeouts left, taken back when stepping back out of
+  it. An admin changing `options.timeouts` of a live game adds the difference to what
+  each team has left.
+
+**The scoreboard feed (§11).** While the board drives a game it supplies:
+* team fouls (the count that counts now is set to the board's);
+* timeouts left;
+* its bonus indicators (`box.boardBonus`, used instead of the computed bonus unless the
+  game is scored by hand);
+* the timeout in progress.
+
+So `timeout` joins the actions refused with `scoreboard_active`, and a `foul` without a
+player is refused (409). `player_points`, a `foul` with a player, and `roster` stay
+with the scorekeeper. The fields are read from the basketball block; all are 1-based
+items:
+
+| Field | Item, length | Value |
+| --- | --- | --- |
+| Timeouts left (total), home / guest | 122, 2 / 130, 2 | number |
+| Timeout in progress, home / guest | 132, 1 / 137, 1 | `<` / `>` lit |
+| Bonus, home / guest | 222 / 229, 1 | lit |
+| Two-shot bonus, home / guest | 223 / 230, 1 | lit |
+| Team fouls, home / guest | 236, 2 / 238, 2 | number |
+
+They come from the open-source `daktronics-allsport-5000` crate's table of ED-12483,
+which agrees with every field above that has a second source. Its author warns that it
+may contain errors, so:
+* **Test connection** (System → Scoreboard) shows the values read;
+* they are checked against the board on a game night (README §8.1).
+
+A blank number is unknown (left alone). While the reading still shows the game before
+(§11 "previous game"), these fields are ignored too.
+
+**Clients.**
+* **Website:**
+  * The console has a **Rosters** panel, open before the game.
+  * Each team's pad has player chips: tap a player, then points or **Foul**.
+  * Each pad also shows Foul / −1, the team's fouls and BONUS, and **Timeout** /
+    **End timeout**.
+  * While the board drives the game, the pads' points buttons credit the tapped player
+    only.
+  * The game page and the console show each team's fouls, timeouts left and bonus, and
+    the box score tables. Cards show BONUS and the timeout.
+* **App:** the same data from the game JSON.
+* **Live Activities** get:
+  * the timeout as the note;
+  * `homeFouls`, `awayFouls`, `homeBonus` and `awayBonus` (§8.5).
+
+A timeout starting or ending and a bonus change are high-priority pushes; a team-foul
+change alone is low priority (5). A player's points alone send no push.

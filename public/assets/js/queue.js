@@ -30,7 +30,7 @@ const defaultSend = (item) =>
 
 // Refused actions that later taps don't build on: after one of these is
 // refused (409), the rest of the queue is still sent.
-const INDEPENDENT_TYPES = new Set(['score', 'set_score', 'clock', 'note']);
+const INDEPENDENT_TYPES = new Set(['score', 'set_score', 'clock', 'note', 'player_points', 'foul', 'timeout', 'roster']);
 
 export class ActionQueue {
   #items = [];

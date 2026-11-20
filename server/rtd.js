@@ -2,7 +2,8 @@
 // stream, as a Lantronix serial-to-Ethernet box forwards it (ARCHITECTURE.md
 // §11). Only the fields live scores use are read: score, main clock and
 // period (volleyball: points in the current game, game number, and each
-// finished game's score).
+// finished game's score; basketball also team fouls, timeouts left, bonus and
+// the timeout in progress, for the box score §13).
 //
 // The console keeps its sport data as one fixed-width ASCII block and sends
 // it in frames, each carrying a piece of the block at an offset - the clock
@@ -45,7 +46,23 @@ export const FIELDS = Object.freeze({
   // Volleyball: score of game N at 222 + 2(N-1) (home) and 242 + 2(N-1) (guest).
   volleyballGameHome: [222, 2],
   volleyballGameGuest: [242, 2],
+  // Basketball only (the same positions mean other things in volleyball).
+  // From the daktronics-allsport-5000 crate's ED-12483 table, which agrees
+  // with the fields above but whose author warns it may contain errors:
+  // checked against a game night's capture (README §8.1).
+  homeTimeoutsLeft: [122, 2], // total timeouts left
+  guestTimeoutsLeft: [130, 2],
+  homeTimeoutOn: [132, 1], // "<" while the home team's timeout runs
+  guestTimeoutOn: [137, 1], // ">"
+  homeBonus: [222, 1], // "<" bonus (one-and-one)
+  homeBonusTwo: [223, 1], // "<" two-shot bonus
+  guestBonus: [229, 1],
+  guestBonusTwo: [230, 1],
+  homeFouls: [236, 2], // team fouls
+  guestFouls: [238, 2],
 });
+// The reading keys these give (all null while unknown).
+export const BOX_READING_KEYS = Object.freeze(['homeFouls', 'awayFouls', 'homeTimeoutsLeft', 'awayTimeoutsLeft', 'homeBonus', 'awayBonus', 'homeTimeout', 'awayTimeout']);
 export const VOLLEYBALL_GAMES = 9;
 
 // Parses the main clock text into milliseconds, or null if it isn't a time.
@@ -69,6 +86,17 @@ function parseNumber(text) {
   if (text === null) return null;
   const value = text.trim();
   return /^\d{1,4}$/.test(value) ? Number(value) : null;
+}
+
+// An indicator: lit (any character) or blank; null while unknown.
+function parseFlag(text) {
+  if (text === null) return null;
+  return text.trim() !== '';
+}
+
+// Either indicator lit; null only while both are unknown.
+function eitherFlag(a, b) {
+  return a === null && b === null ? null : Boolean(a || b);
 }
 
 // One scoreboard's data block, built up from frames. Positions no frame has
@@ -177,6 +205,16 @@ export class RtdReader {
       sportCode: parseNumber(text('sportCode')),
     };
     if (reading.period === 0) reading.period = null;
+    if (sport === 'basketball') {
+      reading.homeFouls = parseNumber(text('homeFouls'));
+      reading.awayFouls = parseNumber(text('guestFouls'));
+      reading.homeTimeoutsLeft = parseNumber(text('homeTimeoutsLeft'));
+      reading.awayTimeoutsLeft = parseNumber(text('guestTimeoutsLeft'));
+      reading.homeBonus = eitherFlag(parseFlag(text('homeBonus')), parseFlag(text('homeBonusTwo')));
+      reading.awayBonus = eitherFlag(parseFlag(text('guestBonus')), parseFlag(text('guestBonusTwo')));
+      reading.homeTimeout = parseFlag(text('homeTimeoutOn'));
+      reading.awayTimeout = parseFlag(text('guestTimeoutOn'));
+    }
     if (sport === 'volleyball') {
       reading.games = [];
       for (let n = 0; n < VOLLEYBALL_GAMES; n += 1) {
