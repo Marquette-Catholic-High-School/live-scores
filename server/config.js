@@ -158,11 +158,19 @@ export function loadConfig(env = process.env, { dotenv = true, publicDir } = {})
   const radioPollSeconds = integer('RADIO_POLL_SECONDS', 10, 5, 300);
   const radioNotifyGapMinutes = integer('RADIO_NOTIFY_GAP_MINUTES', 10, 0, 1440);
 
-  // Firebase Cloud Messaging, for the "the radio is live" notification only
-  // (§12): a service account key file. Blank = no notifications.
+  // Firebase Cloud Messaging, for the "the radio is live" notification (§12)
+  // and the Android game pushes (§8.6): a service account key file. Blank =
+  // neither is sent.
   const fcmKeyPathRaw = raw('FCM_SERVICE_ACCOUNT_PATH');
   const fcmTopic = text('FCM_RADIO_TOPIC', 'radio');
   if (!/^[A-Za-z0-9_.~%-]{1,900}$/.test(fcmTopic)) problems.push(`FCM_RADIO_TOPIC must be a Firebase topic name: letters, digits and - _ . ~ % (got "${fcmTopic}")`);
+
+  // Android Live Updates (§8.6): game starts, updates and ends as FCM data
+  // messages. Off unless switched on, so the radio notification can use
+  // Firebase without them. FCM_GAME_COLLAPSE adds a collapse key per game:
+  // off by default, because Firebase delays collapsible messages sent this often.
+  const androidGamePush = boolean('FCM_GAME_PUSH', false);
+  const androidCollapse = boolean('FCM_GAME_COLLAPSE', false);
 
   const logLevel = text('LOG_LEVEL', 'info').toLowerCase();
   if (!(logLevel in LOG_LEVELS)) problems.push(`LOG_LEVEL must be debug, info, warn or error (got "${logLevel}")`);
@@ -207,6 +215,7 @@ export function loadConfig(env = process.env, { dotenv = true, publicDir } = {})
       serviceAccountPath: fcmKeyPathRaw ? resolvePath(fcmKeyPathRaw) : undefined,
       topic: fcmTopic,
     }),
+    android: Object.freeze({ gamePush: androidGamePush, collapse: androidCollapse }),
     logLevel,
     version: readPackageVersion(),
     packageRoot: PACKAGE_ROOT,

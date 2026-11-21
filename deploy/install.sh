@@ -1430,7 +1430,7 @@ readonly ENV_KEYS=(HOST PORT PUBLIC_URL DATA_DIR TRUST_PROXY SCHOOL_NAME HOME_TE
   APNS_BUNDLE_ID APNS_ENVIRONMENTS APNS_CHANNEL_STORAGE_POLICY APNS_MIN_UPDATE_INTERVAL_MS
   SSE_MAX_PER_IP SSE_MAX_CONNECTIONS RATE_LIMIT_PER_MINUTE DEVICE_RATE_LIMIT_PER_MINUTE
   RADIO_URL RADIO_STATION RADIO_NAME RADIO_STREAM_URL RADIO_POLL_SECONDS RADIO_NOTIFY_GAP_MINUTES
-  FCM_SERVICE_ACCOUNT_PATH FCM_RADIO_TOPIC LOG_LEVEL)
+  FCM_SERVICE_ACCOUNT_PATH FCM_RADIO_TOPIC FCM_GAME_PUSH FCM_GAME_COLLAPSE LOG_LEVEL)
 
 env_default() {
   case $1 in
@@ -1463,6 +1463,8 @@ env_default() {
     RADIO_POLL_SECONDS) printf '10' ;;
     RADIO_NOTIFY_GAP_MINUTES) printf '10' ;;
     FCM_RADIO_TOPIC) printf 'radio' ;;
+    FCM_GAME_PUSH) printf '0' ;;
+    FCM_GAME_COLLAPSE) printf '0' ;;
     LOG_LEVEL) printf 'info' ;;
   esac
 }
@@ -1538,6 +1540,11 @@ $(env_line RADIO_NOTIFY_GAP_MINUTES)
 # this service account key (README "Radio"); without it, no notification.
 $(env_line FCM_SERVICE_ACCOUNT_PATH)
 $(env_line FCM_RADIO_TOPIC)
+# Android Live Updates (README "Android Live Updates"): "1" sends every game
+# start, update and end to the Android app with the same key. Leave
+# FCM_GAME_COLLAPSE at "0": Firebase delays collapsible messages sent this often.
+$(env_line FCM_GAME_PUSH)
+$(env_line FCM_GAME_COLLAPSE)
 
 # Logging: debug | info | warn | error
 $(env_line LOG_LEVEL)

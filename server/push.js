@@ -13,6 +13,9 @@ import { CHANNEL_GONE_REASONS, INVALID_TOKEN_REASONS, SETUP_ERROR_REASONS, descr
 import { activityAttributes, activityChange, activityContentState, gameLabel } from './games.js';
 
 const ENVIRONMENTS = ['production', 'sandbox'];
+// pending_ends also holds the Android app's end message (environment
+// 'android', android-push.js): these flows take only the APNs broadcasts.
+const APNS_ENDS = "environment IN ('production', 'sandbox')";
 const START_CONCURRENCY = 100;
 // Devices claimed per step of a fan-out; the claim is persisted before any of
 // them is sent, so a crash skips at most this many rather than resending.
@@ -617,7 +620,7 @@ export class PushService {
       // Let devices started by the last in-flight pushes join the channel.
       await sleep(this.#startSettleMs);
     }
-    const rows = this.#db.all('SELECT * FROM pending_ends WHERE game_id = ?', gameId);
+    const rows = this.#db.all(`SELECT * FROM pending_ends WHERE game_id = ? AND ${APNS_ENDS}`, gameId);
     await Promise.all(rows.map((row) => this.#deliverEnd(row, { intervalMs })));
   }
 
@@ -710,7 +713,7 @@ export class PushService {
       summary.resynced += 1;
     }
     const ends = [];
-    for (const row of this.#db.all('SELECT * FROM pending_ends WHERE next_attempt_at <= ?', this.#now())) {
+    for (const row of this.#db.all(`SELECT * FROM pending_ends WHERE next_attempt_at <= ? AND ${APNS_ENDS}`, this.#now())) {
       if (this.#ends.has(`${row.game_id}:${row.environment}`)) continue;
       ends.push(this.#track(this.#deliverEnd(row, { delays: [] })));
     }

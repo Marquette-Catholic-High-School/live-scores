@@ -1,7 +1,8 @@
-// Firebase Cloud Messaging (HTTP v1 API) for the one notification this server
-// sends outside APNs: "the radio is live" (ARCHITECTURE.md §12), to a topic the
-// iOS app subscribes to from its Notification Settings. Everything else the app
-// gets from Firebase is sent elsewhere; Live Activities stay on APNs (§8).
+// Firebase Cloud Messaging (HTTP v1 API) for what this server sends outside
+// APNs: the "the radio is live" notification (ARCHITECTURE.md §12), to a topic
+// the app subscribes to from its Notification Settings, and the Android app's
+// game messages (§8.6, android-push.js). Everything else the app gets from
+// Firebase is sent elsewhere; iPhone Live Activities stay on APNs (§8).
 //
 // Auth: a Google service account key (the JSON file Firebase console →
 // Project settings → Service accounts → Generate new private key). The server
@@ -22,11 +23,13 @@ const REQUEST_TIMEOUT_MS = 15_000;
 const base64url = (value) => Buffer.from(value).toString('base64url');
 
 class FcmError extends Error {
-  constructor(message, { status = null, retry = false } = {}) {
+  // `auth`: Google refused the service account itself (the sign-in failed).
+  constructor(message, { status = null, retry = false, auth = false } = {}) {
     super(message);
     this.name = 'FcmError';
     this.status = status;
     this.retry = retry;
+    this.auth = auth;
   }
 }
 
@@ -70,7 +73,9 @@ export class FcmClient {
         if (typeof account?.[field] !== 'string' || account[field] === '') throw new Error(`it has no "${field}" (is it a service account key?)`);
       }
       this.#key = createPrivateKey(account.private_key);
-      this.#account = { projectId: account.project_id, clientEmail: account.client_email, tokenUri: account.token_uri || DEFAULT_TOKEN_URI };
+      const tokenUri = account.token_uri || DEFAULT_TOKEN_URI;
+      if (!URL.canParse(tokenUri)) throw new Error('its "token_uri" is not a URL');
+      this.#account = { projectId: account.project_id, clientEmail: account.client_email, tokenUri };
       this.configured = true;
     } catch (err) {
       this.error = `Couldn't load the Firebase service account key: ${err.message}`;
@@ -85,10 +90,15 @@ export class FcmClient {
     return this.configured ? { configured: true, projectId: this.projectId } : { configured: false, projectId: null, error: this.error };
   }
 
-  // Sends one message ({ topic, notification, data, apns }). Retries network
-  // errors, 429 and 5xx; a rejected access token is renewed once. Resolves to
-  // { ok: true, name } or { ok: false, error } — never throws.
-  async send(message) {
+  // Sends one message ({ topic | condition, notification, data, android, apns }).
+  // Retries network errors, 429 and 5xx (after `retryDelaysMs`: the client's,
+  // unless the call brings its own); a rejected access token is renewed once.
+  // Resolves to { ok: true, name } or { ok: false, error, ... } — never throws.
+  // A message Google didn't take also says why: `status` (HTTP, null for a
+  // network error), `transient` (network, 429, 5xx: the same message may go
+  // through later) and `setup` (Google refused the service account for good:
+  // 401, 403 or a rejected sign-in, which someone has to fix).
+  async send(message, { retryDelaysMs = this.#retryDelaysMs } = {}) {
     if (!this.configured) return { ok: false, error: `Firebase isn't set up: ${this.error}` };
     let renewed = false;
     for (let attempt = 0; ; attempt += 1) {
@@ -103,9 +113,12 @@ export class FcmClient {
           continue;
         }
         const retry = err.retry || !(err instanceof FcmError);
-        if (!retry || attempt >= this.#retryDelaysMs.length) return { ok: false, error: err.message };
+        if (!retry || attempt >= retryDelaysMs.length) {
+          const status = err instanceof FcmError ? err.status : null;
+          return { ok: false, error: err.message, status, transient: retry, setup: !retry && (err.auth === true || status === 401 || status === 403) };
+        }
         this.#log?.warn('FCM send failed; retrying', { error: err.message, attempt: attempt + 1 });
-        await new Promise((resolve) => setTimeout(resolve, this.#retryDelaysMs[attempt]));
+        await new Promise((resolve) => setTimeout(resolve, retryDelaysMs[attempt]));
       }
     }
   }
@@ -143,14 +156,14 @@ export class FcmClient {
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     const text = await res.text();
-    if (!res.ok) throw new FcmError(`Google sign-in failed: ${errorMessage(res.status, text)}`, { status: res.status === 401 ? 400 : res.status, retry: res.status === 429 || res.status >= 500 });
+    if (!res.ok) throw new FcmError(`Google sign-in failed: ${errorMessage(res.status, text)}`, { status: res.status === 401 ? 400 : res.status, retry: res.status === 429 || res.status >= 500, auth: true });
     let body;
     try {
       body = JSON.parse(text);
     } catch {
-      throw new FcmError('Google sign-in failed: the response was not JSON.', { retry: true });
+      throw new FcmError('Google sign-in failed: the response was not JSON.', { retry: true, auth: true });
     }
-    if (typeof body.access_token !== 'string') throw new FcmError('Google sign-in failed: no access token in the response.', { retry: true });
+    if (typeof body.access_token !== 'string') throw new FcmError('Google sign-in failed: no access token in the response.', { retry: true, auth: true });
     const lifetimeMs = (Number.isFinite(body.expires_in) ? body.expires_in : TOKEN_LIFETIME_S) * 1000;
     this.#token = { value: body.access_token, expiresAt: now + lifetimeMs };
     return this.#token.value;

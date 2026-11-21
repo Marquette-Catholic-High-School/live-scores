@@ -16,7 +16,7 @@ function pushLogView(row) {
   };
 }
 
-export function registerAdminRoutes(router, { config, db, apns, sse, scoreboard, radio }) {
+export function registerAdminRoutes(router, { config, db, apns, androidPush, sse, scoreboard, radio }) {
   router.get(
     '/api/admin/status',
     () => {
@@ -42,6 +42,7 @@ export function registerAdminRoutes(router, { config, db, apns, sse, scoreboard,
       if (!apns.configured) apnsStatus.error = apns.error;
       return {
         apns: apnsStatus,
+        android: androidPush.status(),
         devices,
         recentPushes: db.all('SELECT * FROM push_log ORDER BY id DESC LIMIT 50').map(pushLogView),
         sseClients: sse.size,

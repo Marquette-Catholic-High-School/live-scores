@@ -31,10 +31,14 @@ them drift.
 8. **The box score** (§13, basketball): the scorekeeper types in both rosters and credits
    each basket and foul to a player; the portal, the app and the Live Activity show team
    fouls, the bonus and timeouts (from the gym scoreboard for games it drives).
+9. **Android** (§8.6, off unless switched on): the Android app shows a followed game as a
+   **Live Update**. The server sends it every game start, update and end as one Firebase
+   Cloud Messaging message, so it stays current with the app closed.
 
-Firebase is **not** used by any part of this system, with one exception: the "the radio
-is live" notification (§12) is sent through Firebase Cloud Messaging to a topic, because
-that is how the app receives its other announcements. The rest of the iOS app
+Firebase is **not** used by any part of this system, with two exceptions, both through
+Firebase Cloud Messaging: the "the radio is live" notification (§12) goes to a topic,
+because that is how the app receives its other announcements, and the Android app's game
+messages (§8.6) do, because that is how a server reaches an Android phone. The rest of the iOS app
 (accounts, photographer scheduler, Photo Drop, FCM announcements) stays on
 Firebase and is untouched; the touch points are the notification settings screen,
 where the app's own "Live Activities" switch (on by default, separate from the "Sports
@@ -75,6 +79,8 @@ switch (the FCM topic §12 sends to).
   in step.
 * **iOS**: SwiftUI app + WidgetKit extension. ActivityKit (iOS 18+ — the app's
   deployment target is 18.6, so broadcast channels are always available).
+* **Android** (its own project): the same REST API and SSE stream; a followed game is a
+  Live Update, kept current by FCM data messages once the server sends them (§8.6).
 
 ## 3. Configuration (environment)
 
@@ -105,7 +111,7 @@ quotes every value it writes.
 | `APNS_BUNDLE_ID` | `org.marquettecatholic.app` | App bundle id (topic) |
 | `APNS_ENVIRONMENTS` | `production,sandbox` | Which APNs environments to serve. Devices register with their environment; channels are created per environment |
 | `APNS_CHANNEL_STORAGE_POLICY` | `0` | Broadcast channel message storage policy (0 = No Message Stored, 1 = Most Recent Message Stored) |
-| `APNS_MIN_UPDATE_INTERVAL_MS` | `5000` | Base minimum interval between broadcast updates per game (adaptive on 429) |
+| `APNS_MIN_UPDATE_INTERVAL_MS` | `5000` | Base minimum interval between broadcast updates per game (adaptive on 429); the Android updates (§8.6) use it too |
 | `SSE_MAX_PER_IP` | `2000` | Concurrent `/api/stream` connections per client address (§7.1) |
 | `SSE_MAX_CONNECTIONS` | `20000` | Concurrent `/api/stream` connections in total; the systemd unit's `LimitNOFILE` is kept above it (≥ 65536) |
 | `RATE_LIMIT_PER_MINUTE` | `3000` | `/api/*` requests per client address per minute without a valid session (signed-in staff are not counted) |
@@ -116,8 +122,10 @@ quotes every value it writes.
 | `RADIO_STREAM_URL` | `<RADIO_URL>/listen/<RADIO_STATION>/radio.mp3` | The stream clients play |
 | `RADIO_POLL_SECONDS` | `10` | How often the station is checked (5–300) |
 | `RADIO_NOTIFY_GAP_MINUTES` | `10` | A station back on the air within this many minutes of its last broadcast doesn't notify again (0–1440) |
-| `FCM_SERVICE_ACCOUNT_PATH` | — | Path to a Firebase service account key (JSON) for the go-live notification (§12); blank = no notification |
+| `FCM_SERVICE_ACCOUNT_PATH` | — | Path to a Firebase service account key (JSON) for the go-live notification (§12) and the Android game messages (§8.6); blank = neither is sent |
 | `FCM_RADIO_TOPIC` | `radio` | The FCM topic the notification goes to (the app's "Sports Radio" setting) |
+| `FCM_GAME_PUSH` | `0` | `1` = send every game start, update and end to the Android app over FCM (§8.6). Needs `FCM_SERVICE_ACCOUNT_PATH`; `GET /api/config` then reports `androidLiveUpdates: true` |
+| `FCM_GAME_COLLAPSE` | `0` | `1` = give those messages a collapse key per game. Off for a reason: Firebase delays collapsible messages sent this often (§8.6) |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
 
 "Client address" = the client IP (behind Caddy or a Cloudflare Tunnel: the last
@@ -129,12 +137,14 @@ single public address and open the scoreboard at the same moment.
 Every value is validated at startup (`server/config.js`): e.g. `PORT` 0–65535,
 `START_WINDOW_MINUTES` 0–10080, `AUTO_FINAL_HOURS` 0.1–168, the four capacity limits
 (`SSE_MAX_PER_IP` … `DEVICE_RATE_LIMIT_PER_MINUTE`) 1–1 000 000, `APNS_CHANNEL_STORAGE_POLICY` 0|1,
-`APNS_MIN_UPDATE_INTERVAL_MS` 0–60 000, `TRUST_PROXY` 1/0 (also true/false, yes/no,
-on/off). An invalid value stops the server with `Invalid configuration` and the list
-of bad keys.
+`APNS_MIN_UPDATE_INTERVAL_MS` 0–60 000, `TRUST_PROXY`, `FCM_GAME_PUSH` and
+`FCM_GAME_COLLAPSE` 1/0 (also true/false, yes/no, on/off). An invalid value stops the
+server with `Invalid configuration` and the list of bad keys.
 
 If any `APNS_*` credential is missing (or the key can't be loaded) the server still
-runs; pushes are skipped and `/api/health` reports `apns.configured: false`.
+runs; pushes are skipped and `/api/health` reports `apns.configured: false`. The same
+goes for Firebase: without a readable `FCM_SERVICE_ACCOUNT_PATH` nothing is sent over FCM,
+whatever `FCM_GAME_PUSH` says, and `/api/config` reports `androidLiveUpdates: false`.
 
 ## 4. Data model (SQLite)
 
@@ -207,8 +217,9 @@ devices(
   invalid_at INTEGER, last_error TEXT
 )
 push_log(
-  id INTEGER PRIMARY KEY, game_id TEXT, kind TEXT NOT NULL,   -- 'start' | 'update' | 'end' | 'channel'
-  environment TEXT, sent INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
+  id INTEGER PRIMARY KEY, game_id TEXT, kind TEXT NOT NULL,   -- 'start' | 'update' | 'end' | 'channel' | 'radio' (§12)
+  environment TEXT,                  -- 'production' | 'sandbox' (APNs), 'android' (FCM game messages, §8.6), NULL (radio)
+  sent INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
   detail TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL
 )
 -- schema version 2: push state that must survive a restart (§8):
@@ -222,7 +233,7 @@ push_progress(                       -- PRIMARY KEY (game_id, environment)
 )
 pending_ends(                        -- PRIMARY KEY (game_id, environment); no foreign key: survives deleting the game
   game_id, environment, channel_id, payload,  -- the end broadcast, built when the game ended (§8.3)
-  detail, created_at, next_attempt_at
+  detail, created_at, next_attempt_at         -- environment 'android': the FCM end message (§8.6), channel_id ''
 )
 channel_cleanup(                     -- PRIMARY KEY (environment, channel_id)
   environment, channel_id, game_id,
@@ -421,7 +432,7 @@ Codes used: `bad_request` 400, `unauthorized` 401, `forbidden` 403, `not_found` 
 * Passwords: `crypto.scrypt` (N=16384, r=8, p=1, 64-byte key, 16-byte random salt), constant-time compare. Minimum 8 characters.
 
 ### Public (no auth)
-* `GET /api/config` → `{ schoolName, homeTeam: { name, code, color }, startWindowMinutes, timeZone, apnsEnabled, radio: { name, playerUrl } | null, version }` (`radio` null while `RADIO_URL=off`)
+* `GET /api/config` → `{ schoolName, homeTeam: { name, code, color }, startWindowMinutes, timeZone, apnsEnabled, androidLiveUpdates, radio: { name, playerUrl } | null, version }` (`radio` null while `RADIO_URL=off`; `androidLiveUpdates` true while the server sends game messages to the Android app, §8.6)
 * `GET /api/radio` → `{ radio: Radio | null }` (§12)
 * `GET /api/sports` → `{ sports: { <id>: <SPORTS entry + "id"> } }`
 * `GET /api/games?scope=board|all[&before=<unix ms>]` → `{ games: [Game], radio: Radio | null }` (§12: a client polling the board still sees the radio go live)
@@ -489,7 +500,7 @@ Codes used: `bad_request` 400, `unauthorized` 401, `forbidden` 403, `not_found` 
 * `POST /api/users` `{ username, displayName, password, role }` → `{ user }` (409 if username taken)
 * `PATCH /api/users/:id` `{ displayName?, role?, disabled?, password? }` → `{ user }` — setting a password or disabling revokes that user's sessions. An admin can't demote/disable/delete themself, and the last enabled admin can't be removed (409).
 * `DELETE /api/users/:id` → `{ ok: true }`
-* `GET /api/admin/status` → `{ apns: { configured, environments, teamId, keyId, bundleId, error? }, devices: { production: { enabled, total, invalid }, sandbox: {…} }, recentPushes: [push_log rows, newest 50], sseClients, radio }` (`error` only while APNs isn't configured; `radio` §12)
+* `GET /api/admin/status` → `{ apns: { configured, environments, teamId, keyId, bundleId, error? }, android: { enabled, projectId, error? }, devices: { production: { enabled, total, invalid }, sandbox: {…} }, recentPushes: [push_log rows, newest 50], sseClients, radio }` (`error` only while APNs isn't configured; `android` §8.6, with an `error` while `FCM_GAME_PUSH` is on but Firebase isn't set up; `radio` §12)
 * `POST /api/admin/radio/check` → `{ radio }` — checks the station now (§12) and returns what `admin/status` would
 * `POST /api/admin/apns-check` → `{ results: { <env>: { ok, channelId?, error? } } }` — creates a test broadcast channel in each environment, reads it back, then deletes it. Verifies the key, team, bundle and broadcast capability end to end.
 * `GET /api/admin/scoreboard` → `{ defaultAddress: "<ip>:<port>" | "udp://<ipv4>:<port>" | null, feeds: [{ address, gameId, watching, state, error, lastReadingAt }] }` (§11) — one feed per scoreboard a live game reads (`watching: false`), and one per scoreboard watched for a scheduled game to start (`watching: true`, `gameId` = that game)
@@ -543,7 +554,8 @@ data: {"serverTime":…,"radio":{…Radio…}}
 ## 8. Live Activity push flows (APNs)
 
 APNs specifics (hosts, ports, headers, payload keys) are in §8.4 and are the
-verified values the server must use.
+verified values the server must use. The Android app gets the same game events over
+Firebase Cloud Messaging instead: §8.6.
 
 ### 8.1 Start (scorekeeper taps **Start game**, or the scoreboard starts the game, §11)
 1. For each environment in `APNS_ENVIRONMENTS`: create a broadcast channel for the game
@@ -698,6 +710,89 @@ the devices it hasn't reached), not the ones already on Lock Screens.
   default value). Future fields must be added as Optionals.
 * Combined size of `attributes` + `content-state` must stay well under 4 KB (team
   names ≤ 40 chars keep it ~600 bytes).
+
+### 8.6 Android Live Updates (Firebase Cloud Messaging)
+
+The Android app shows a followed game as a **Live Update** (a status bar chip, the top of
+the notification shade, the lock screen): its counterpart of the Live Activity. Android
+has no push-to-start and no broadcast channels, so the server sends **one FCM HTTP v1
+data message per game event** to two topics and Firebase fans it out. The app subscribes
+to `live-games` while its **Follow every game** setting is on and to `game-<gameId>` for
+each game it follows. Phones are not registered with the server (`POST /api/devices` is
+for iPhones).
+
+**Off by default.** Game messages are sent only with `FCM_GAME_PUSH=1` **and** the
+Firebase service account of §12 loaded (`FCM_SERVICE_ACCOUNT_PATH`). `GET /api/config`
+then reports `"androidLiveUpdates": true`, which is what makes the app rely on pushes (and
+offer **Follow every game**) instead of keeping its own stream open in the background.
+Without the switch the radio notification (§12) still works and no game message is sent.
+APNs is not needed. Code: `server/android-push.js` (the flows), `server/fcm.js` (the client).
+There is no sandbox as with APNs: topics belong to the Firebase project, so every server
+running with that project's key and the switch on reaches the same phones. Test servers
+leave it off.
+
+**The message** (`event`: `start` | `update` | `end`):
+```jsonc
+{ "condition": "'live-games' in topics || 'game-k3j9x2m4pq' in topics",
+  "android": { "priority": "HIGH", "ttl": "120s" },                                   // end: "7200s"
+  "data": { "kind": "game", "event": "update",
+            "attributes": "{\"gameId\":\"k3j9x2m4pq\",\"sport\":\"basketball\",…}",    // §8.5 attributes, as JSON text
+            "state": "{\"status\":\"live\",\"homeScore\":54,\"awayScore\":50,…}" } }     // §8.5 content-state, as JSON text
+```
+* FCM data values must be strings, so the two objects of §8.5 travel as JSON text. They
+  are built by the functions that build the APNs payloads (`activityAttributes`,
+  `activityContentState`), so the two can't drift. Every message carries both: a phone
+  that missed the start draws the game from any update, and a label edited mid-game
+  (§8.5) reaches phones with the next message.
+* One difference from the APNs content state: a running clock that has reached 0:00 is
+  sent as stopped at 0:00 (`clockRemaining: 0`, no `clockEndsAt`). Whether a `clockEndsAt`
+  has passed would otherwise depend on each phone's own clock.
+* `ttl` is how long Firebase keeps the message for a phone it can't reach: 120 s for a
+  start or an update (soon out of date), 2 h for the end.
+* **No collapse key**, unless `FCM_GAME_COLLAPSE=1` adds `"collapse_key": "game-<gameId>"`
+  to `android`. With one, a phone that was offline gets only the game's latest message.
+  But Firebase limits collapsible messages to a burst of 20 per app and device, refilled
+  by one every 3 minutes, and delays the rest (a game sends updates far more often); it
+  also keeps at most four collapse keys per device. Its advice for frequent messages that
+  carry their content is to send them without one.
+* Firebase fans topic messages out itself, optimized "for throughput rather than
+  latency": a message can take a little longer than one sent to a single device.
+
+**Start.** When a game starts (§8.1): one `start` with the initial state. There is no list
+of devices to work through, so nothing is persisted for it. If Firebase can't take it, it
+is retried like an update, and the first message that gets through, whatever its `event`,
+has all a phone needs.
+
+**Update.** The same changes as §8.2 (a live game; what the Lock Screen shows), with the
+same coalescing: per game, leading + trailing, on `APNS_MIN_UPDATE_INTERVAL_MS`. One
+message per game is on its way at a time, so they reach Firebase in order; the game's
+first update isn't held back by its start. A transient failure (network, `429`, `5xx`)
+is retried with the latest state and doubles that game's interval (cap 60 s); each
+success shrinks it by 1 s back toward the base. Any other failure is logged and not
+retried. After a restart the scheduler's first run sends one fresh `update` for every
+live game.
+
+**Clock at 0:00.** The server makes no change when a clock the scorekeeper started runs
+out (only the scoreboard feed, §11, reports 0:00), and iOS stops a Live Activity's timer
+at zero by itself. An Android notification's timer counts on below zero. So the server
+remembers until when the last message it sent says the clock runs, and at that moment
+sends an `update` **without waiting for the interval**: the clock stopped at 0:00, or
+whatever happened to it since that hadn't been sent yet (a stop in the last seconds).
+Once per run of the clock. (While a failed send has that game's interval backed off, it
+waits like any other update.)
+
+**End.** One `end` with the final state (note cleared; `Canceled` for a canceled game),
+after any update still on its way. Like the APNs end (§8.3) it is persisted before it is
+sent, in `pending_ends` with environment `android`, and retried: after 1, 3 and 10 s, then
+every minute by the scheduler, also after a restart or after the game was deleted, until
+Firebase takes it, rejects it, or 8 h have passed. Transient failures and a refused
+service account (`401`, `403`, a failed Google sign-in) are retried; anything else drops
+it. A phone that never gets the end keeps the game's Live Update, marked as no longer
+updating, until its owner opens the app or unpins it. An end left over after
+`FCM_GAME_PUSH` was switched off is deleted once it is 8 h old.
+
+**Log.** Every message is a `push_log` row: `kind` `start` | `update` | `end`,
+`environment` `android`. The portal's **Recent pushes** shows them next to the APNs rows.
 
 ## 9. iOS app
 
@@ -1103,7 +1198,8 @@ itself and a streamer/DJ account for each broadcaster.
   (`iss` = `client_email`, `scope` = `https://www.googleapis.com/auth/firebase.messaging`,
   `aud` = `token_uri`, 1 h) traded at `token_uri` for an access token, cached until 5 minutes
   before it expires; a 401/403 renews it once; network errors, 429 and 5xx are retried twice
-  (2 s, 10 s). Each notification is a `push_log` row (`kind` `radio`, no environment).
+  (2 s, 10 s; the game messages of §8.6 retry by themselves instead). Each notification is a
+  `push_log` row (`kind` `radio`, no environment).
   Without `FCM_SERVICE_ACCOUNT_PATH` the radio works and the row says why nothing was sent.
 
 

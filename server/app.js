@@ -2,6 +2,7 @@
 // HTTP server. Used by index.js and by the tests (which inject a clock, a
 // fake APNs transport, and a fake fetch for the radio station and Firebase).
 
+import { AndroidPushService } from './android-push.js';
 import { ApnsClient } from './apns.js';
 import { AuthService } from './auth.js';
 import { openDatabase } from './db.js';
@@ -32,6 +33,7 @@ export function createApp({
   scoreboardOptions = {},
   radioOptions = {},
   fcmOptions = {},
+  androidPushOptions = {},
 } = {}) {
   const db = openDatabase(config.dbPath);
   const auth = new AuthService({ db, now, log });
@@ -59,9 +61,11 @@ export function createApp({
   const push = new PushService({ db, apns, config, log: log.child({ component: 'push' }), now, store: games, ...pushOptions });
   const scoreboard = new ScoreboardService({ db, games, config, log: log.child({ component: 'scoreboard' }), now, ...scoreboardOptions });
   games.setScoreboard(scoreboard);
-  // The radio station (§12): its status in every SSE hello, and the "we're
-  // live" notification over Firebase Cloud Messaging.
+  // Firebase Cloud Messaging carries the radio's "we're live" notification
+  // (§12) and, when switched on, the Android app's game pushes (§8.6).
   const fcm = new FcmClient({ serviceAccountPath: config.fcm.serviceAccountPath, log: log.child({ component: 'fcm' }), now, ...fcmOptions });
+  const androidPush = new AndroidPushService({ db, fcm, config, log: log.child({ component: 'android-push' }), now, store: games, ...androidPushOptions });
+  // The radio station (§12): its status in every SSE hello.
   const radio = new RadioService({ config, db, games, sse, fcm, log: log.child({ component: 'radio' }), now, ...radioOptions });
   sse.setHelloData(() => (radio.configured ? { radio: radio.status() } : {}));
   // Feed status changes (connected, unreachable, ...) are part of the game's
@@ -87,24 +91,42 @@ export function createApp({
       push.changed(before, after);
       // Which game the radio carries may have changed (switched on or off the radio, started, ended).
       if (before?.radio || after.radio) radio.refresh();
+      androidPush.changed(before, after);
     },
     removed: (game) => {
       scoreboard.refresh();
       sse.publishRemoved(game.id);
       push.forget(game);
       if (game.radio) radio.refresh();
+      androidPush.forget(game);
     },
-    started: (game) => push.start(game),
-    ended: (game, options) => push.end(game, options),
+    // The Android pushes (§8.6) come last in every hook, so they can't keep
+    // anything else from happening. The start and the end also go out whatever
+    // becomes of the APNs flow before them. `started` returns the number of
+    // iPhones a push-to-start was queued for.
+    started: (game) => {
+      try {
+        return push.start(game);
+      } finally {
+        androidPush.start(game);
+      }
+    },
+    ended: (game, options) => {
+      try {
+        push.end(game, options);
+      } finally {
+        androidPush.end(game, options);
+      }
+    },
   });
 
-  const scheduler = new Scheduler({ games, push, db, log, now, intervalMs: schedulerIntervalMs, environments: config.apns.environments });
+  const scheduler = new Scheduler({ games, push, androidPush, db, log, now, intervalMs: schedulerIntervalMs, environments: config.apns.environments });
   const limiters = {
     global: new RateLimiter({ limit: globalRateLimitPerMinute, windowMs: 60_000, now }),
     devices: new RateLimiter({ limit: deviceRateLimitPerMinute, windowMs: 60_000, now }),
   };
   const startedAt = now();
-  const router = buildRouter({ config, db, auth, users, apns, sse, games, push, scoreboard, radio, log, now, startedAt, limiters });
+  const router = buildRouter({ config, db, auth, users, apns, sse, games, push, androidPush, scoreboard, radio, log, now, startedAt, limiters });
   const server = createHttpServer({ config, log, router, auth, now, globalLimiter: limiters.global });
 
   let closing = null;
@@ -119,6 +141,7 @@ export function createApp({
     sse,
     games,
     push,
+    androidPush,
     scoreboard,
     fcm,
     radio,
@@ -162,9 +185,10 @@ export function createApp({
           });
           server.closeIdleConnections();
         });
-        await push.flush(pushFlushTimeoutMs);
+        await Promise.all([push.flush(pushFlushTimeoutMs), androidPush.flush(pushFlushTimeoutMs)]);
         await radio.flush(pushFlushTimeoutMs);
         push.close();
+        androidPush.close();
         apns.close();
         db.close();
       })();
