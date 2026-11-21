@@ -10,8 +10,10 @@ scoreboard is on, and end at the final horn. It runs on one small Linux VM: one 
 process, an SQLite database file, and Caddy for HTTPS (or, if you prefer no open ports,
 a [Cloudflare Tunnel](#53-cloudflare-tunnel-instead-of-open-ports)). Apple's push service
 (APNs) does the heavy lifting of delivering updates to phones. The only other cloud
-service is Firebase, and only for the optional "the radio is live" notification
-([section 8.2](#82-the-radio-marquette-nation-sports)); everything else works without it.
+service is Firebase, and only for two optional things: the "the radio is live" notification
+([section 8.2](#82-the-radio-marquette-nation-sports)) and score updates for the Android
+app's Live Updates ([section 8.4](#84-android-live-updates)); everything else works
+without it.
 
 ```
                  ┌──────────────────────── your VM ────────────────────────┐
@@ -110,7 +112,7 @@ that box's address only; re-running the installer keeps it.
 | `api-manage-broadcast.sandbox.push.apple.com` | **TCP 2195** | Create/read/delete broadcast channels (sandbox) |
 | `acme-v02.api.letsencrypt.org` (and `acme.zerossl.com` as fallback) | TCP 443 | HTTPS certificates (automatic renewal) |
 | The radio station (`RADIO_URL`, default `radio.marquettenation.com`) | TCP 443 | Whether the radio is live (8.2) |
-| `oauth2.googleapis.com`, `fcm.googleapis.com` | TCP 443 | The "radio is live" notification (8.2; only with `FCM_SERVICE_ACCOUNT_PATH`) |
+| `oauth2.googleapis.com`, `fcm.googleapis.com` | TCP 443 | The "radio is live" notification (8.2) and Android Live Updates (8.4); only with `FCM_SERVICE_ACCOUNT_PATH` |
 | OS package mirrors: Ubuntu `archive.ubuntu.com`, `security.ubuntu.com` (arm64: `ports.ubuntu.com`); Debian `deb.debian.org`, `security.debian.org`; or your cloud's own mirror (see `/etc/apt/sources.list.d/`) | TCP 80/443 | OS packages and updates |
 | `deb.nodesource.com` | TCP 443 | Node.js (setup script and packages) |
 | `dl.cloudsmith.io` | TCP 443 | Caddy (repository key, list and packages) |
@@ -793,6 +795,57 @@ screen and the Live Activity show them. Details: ARCHITECTURE.md §13.
   they must match what the board shows. Their positions in the scoreboard's data come
   from an open-source decoder, not from Daktronics, so if one is off, tell whoever
   maintains the server: it's a one-line fix in `server/rtd.js`.
+
+### 8.4 Android Live Updates
+
+On Android the counterpart of the Live Activity is the **Live Update**: a fan taps
+**Follow Live** on a game and its score stays in the status bar, at the top of the
+notifications and on the lock screen. Out of the box this server pushes game changes to
+iPhones only, and the Android app keeps a followed game current by itself, with a
+connection it holds open in the background. Switch **game pushes for Android** on and
+the server sends every game start, change and end to the Android app through Firebase
+Cloud Messaging: Live Updates then stay current with the app closed, and the app offers
+**Follow every game**. Details: ARCHITECTURE.md §8.6.
+
+**Turn it on** (it is off until you do):
+
+1. The server needs a Firebase service account key, the same one the radio notification
+   uses: [8.2](#82-the-radio-marquette-nation-sports), "One-time setup", steps 1 and 2.
+   If that is already done, there is nothing to install. The key must belong to the
+   Firebase project the Android app is built with (`project_id` in the app's
+   `google-services.json`).
+2. In `/etc/mchs-live/mchs-live.env` set `FCM_GAME_PUSH="1"` (and
+   `FCM_SERVICE_ACCOUNT_PATH`, if step 1 was new), then `sudo systemctl restart mchs-live`.
+3. Check it:
+   ```bash
+   curl -s https://<domain>/api/config
+   ```
+   now contains `"androidLiveUpdates":true`. During a game, **System** → **Recent pushes**
+   lists each message with the environment `android`.
+
+To turn it off again, set `FCM_GAME_PUSH="0"` and restart. The Android app then goes back
+to keeping followed games current by itself, the next time it is opened. The radio
+notification doesn't depend on this switch.
+
+* **What is sent**: one message per game for the start, for each change (combined to at
+  most one every 5 s per game, like the Lock Screen updates), at the moment a running
+  game clock reaches 0:00, and for the end. Firebase delivers it to every phone that
+  follows the game or has **Follow every game** on; the server keeps no list of Android
+  phones.
+* **The end always goes out**: if Firebase can't be reached when a game ends, the server
+  keeps trying every minute for up to 8 hours, also after a restart, so a finished game
+  doesn't stay on phones as live.
+* **`FCM_GAME_COLLAPSE`** stays `"0"`. With `"1"` a phone that was offline gets only a
+  game's latest message, but Firebase then delays messages sent as often as a game's
+  updates (it allows a burst of 20 per phone, then one every 3 minutes).
+* **Only on the real server**: Firebase has no sandbox like Apple's. A second server
+  running with the same key and `FCM_GAME_PUSH="1"` (a test VM, a laptop) would push its
+  test games to every phone that follows every game. Leave the switch off there.
+* **`"androidLiveUpdates":false` after the restart**: `journalctl -u mchs-live -n 50` says
+  why (`FCM_GAME_PUSH is on but Firebase is not set up`, with the reason). **Failed rows in
+  Recent pushes** carry Google's answer: `HTTP 403` means the key isn't allowed to send
+  messages for that project (wrong project's key, or the Firebase Cloud Messaging API is
+  disabled for it in the Google Cloud console).
 
 ## 9. Verify APNs
 

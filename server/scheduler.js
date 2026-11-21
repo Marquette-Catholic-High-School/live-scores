@@ -1,6 +1,6 @@
 // Periodic jobs (every 60 s): auto-final forgotten live games, finish push
-// work a restart or an APNs outage interrupted, delete broadcast channels
-// 6 h after a game ended, and housekeeping (ARCHITECTURE.md §4, §8.3).
+// work a restart or an APNs or Firebase outage interrupted, delete broadcast
+// channels 6 h after a game ended, and housekeeping (ARCHITECTURE.md §4, §8.3, §8.6).
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -11,6 +11,7 @@ const UNSERVED_DEVICE_RETENTION_MS = 30 * DAY_MS;
 export class Scheduler {
   #games;
   #push;
+  #androidPush;
   #db;
   #log;
   #now;
@@ -22,9 +23,10 @@ export class Scheduler {
 
   // `environments`: the APNs environments served; devices registered for
   // another one are deleted once idle for 30 days.
-  constructor({ games, push, db, log, now = Date.now, intervalMs = 60_000, environments = ['production', 'sandbox'] }) {
+  constructor({ games, push, androidPush = null, db, log, now = Date.now, intervalMs = 60_000, environments = ['production', 'sandbox'] }) {
     this.#games = games;
     this.#push = push;
+    this.#androidPush = androidPush;
     this.#db = db;
     this.#log = log;
     this.#now = now;
@@ -49,7 +51,7 @@ export class Scheduler {
   }
 
   async #run() {
-    const summary = { autoFinal: [], push: null, channelsDeleted: 0, pushLogDeleted: 0, sessionsDeleted: 0, devicesDeleted: 0 };
+    const summary = { autoFinal: [], push: null, androidPush: null, channelsDeleted: 0, pushLogDeleted: 0, sessionsDeleted: 0, devicesDeleted: 0 };
     try {
       summary.autoFinal = this.#games.autoFinalize();
     } catch (err) {
@@ -60,6 +62,12 @@ export class Scheduler {
       summary.push = await this.#push.resume();
     } catch (err) {
       this.#log?.error('push resume job failed', { err });
+    }
+
+    try {
+      summary.androidPush = (await this.#androidPush?.resume()) ?? null;
+    } catch (err) {
+      this.#log?.error('android push resume job failed', { err });
     }
 
     try {
@@ -86,7 +94,8 @@ export class Scheduler {
     }
 
     const push = summary.push ?? {};
-    if (summary.autoFinal.length || push.starts || push.resynced || push.ends || summary.channelsDeleted || summary.pushLogDeleted || summary.sessionsDeleted || summary.devicesDeleted) {
+    const android = summary.androidPush ?? {};
+    if (summary.autoFinal.length || push.starts || push.resynced || push.ends || android.resynced || android.ends || summary.channelsDeleted || summary.pushLogDeleted || summary.sessionsDeleted || summary.devicesDeleted) {
       this.#log?.info('scheduler run', summary);
     }
     return summary;

@@ -13,13 +13,16 @@ function deviceToken(value, field) {
   return token;
 }
 
-export function registerPublicRoutes(router, { config, db, games, sse, apns, radio, limiters, now, startedAt }) {
+export function registerPublicRoutes(router, { config, db, games, sse, apns, androidPush, radio, limiters, now, startedAt }) {
   router.get('/api/config', () => ({
     schoolName: config.schoolName,
     homeTeam: { ...config.homeTeam },
     startWindowMinutes: config.startWindowMinutes,
     timeZone: config.timeZone,
     apnsEnabled: apns.configured,
+    // The Android app follows games from pushes (§8.6) instead of keeping its
+    // own connection open in the background.
+    androidLiveUpdates: androidPush.configured,
     radio: config.radio.enabled ? { name: config.radio.name, playerUrl: config.radio.playerUrl } : null,
     version: config.version,
   }));

@@ -137,7 +137,7 @@ describe('HTTP layer and static files', () => {
     assert.equal(typeof sports.serverTime, 'number');
     assert.equal(sports.sports.basketball.id, 'basketball');
     const config = await (await fetch(`${t.baseUrl}/api/config`)).json();
-    assert.deepEqual(Object.keys(config).sort(), ['apnsEnabled', 'homeTeam', 'radio', 'schoolName', 'serverTime', 'startWindowMinutes', 'timeZone', 'version']);
+    assert.deepEqual(Object.keys(config).sort(), ['androidLiveUpdates', 'apnsEnabled', 'homeTeam', 'radio', 'schoolName', 'serverTime', 'startWindowMinutes', 'timeZone', 'version']);
     assert.deepEqual(config.homeTeam, { name: 'Marquette', code: 'MAR', color: '#12214D' });
     assert.equal(config.timeZone, 'America/Chicago');
     const health = await (await fetch(`${t.baseUrl}/api/health`)).json();

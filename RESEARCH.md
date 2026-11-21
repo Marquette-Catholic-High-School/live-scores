@@ -137,6 +137,41 @@ leading slash — use the documented hosts above and `/4/broadcasts/...`.)
 * The widget extension's deployment target must be ≤ the lowest iOS that should show the
   Live Activity — at 26.5 it was silently missing on iOS 18.6–26.4.
 
+## Firebase Cloud Messaging — game messages for Android (checked November 2026)
+
+What ARCHITECTURE.md §8.6 depends on, from Google's Firebase documentation
+(firebase.google.com/docs: the FCM REST reference `projects.messages`, "Send Messages to
+Topics", "FCM Throttling and Quotas", and the pages on message priority, lifespan and
+collapsible messages).
+
+* **HTTP v1** `POST https://fcm.googleapis.com/v1/projects/<project id>/messages:send`,
+  body `{ "message": { … } }`, OAuth 2 bearer token for the scope
+  `https://www.googleapis.com/auth/firebase.messaging` (the service-account flow of §12).
+* `message.condition`: a string such as `'a' in topics || 'b' in topics` (`&&`, `||`,
+  parentheses; at most **five** topics). It takes the place of `topic` / `token`.
+* `message.data`: a map of string to string (values must be strings). Reserved keys:
+  `from`, `message_type`, and anything starting with `google.` or `gcm.notification.`.
+  A data-only message is handed to the app's `onMessageReceived` in the background too.
+* `message.android`: `priority` is `NORMAL` or `HIGH`; `ttl` is a duration string
+  (`"120s"`), 0 to 4 weeks, default 4 weeks, `"0s"` = deliver now or never (never
+  stored); `collapse_key` is a string.
+* **Collapsible messages are throttled**: a burst of 20 per app and device, refilled by
+  one every 3 minutes; messages over that are delayed, not dropped. FCM also keeps at most
+  **4** collapse keys per device. For frequent messages that carry their content, Google
+  suggests non-collapsible ones. This is why the game messages have no collapse key
+  unless `FCM_GAME_COLLAPSE=1`: a game sends an update every few seconds at times.
+* Without a collapse key FCM stores up to 100 messages for a device that is offline (all
+  are discarded beyond that). The 120 s `ttl` of a start or an update keeps a game far
+  below it: at most 24 pending messages a game at one every 5 s.
+* **Rates**: up to 240 messages a minute and 5,000 an hour to one Android device; at most
+  1,000 topic fan-outs in progress per project. Topic messages are "optimized for
+  throughput rather than latency".
+* **High priority** is meant for messages that lead to something the user sees. If an
+  app's high-priority messages usually don't, FCM may lower their priority. A game
+  message updates the game's Live Update on every phone that follows the game.
+* Topics belong to the Firebase project. There is no sandbox / production split as with
+  APNs: every server using the project's key reaches the same subscribers.
+
 ## Server platform
 
 * **Node.js** (2026-10-30): Node 26 = Active LTS (since 2026-10-28, v26.13.0, EOL 2029-04-30);

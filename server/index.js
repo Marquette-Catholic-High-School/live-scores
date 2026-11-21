@@ -58,9 +58,13 @@ async function main() {
     version: config.version,
     node: process.version,
     apns: app.apns.status(),
+    android: app.androidPush.status(),
   });
   if (!app.apns.configured) {
     log.warn('APNs is not configured: Live Activity pushes are disabled', { reason: app.apns.error });
+  }
+  if (config.android.gamePush && !app.androidPush.configured) {
+    log.warn('FCM_GAME_PUSH is on but Firebase is not set up: Android game pushes are disabled', { reason: app.fcm.error });
   }
 }
 
