@@ -100,9 +100,10 @@ export function createApp({
       if (game.radio) radio.refresh();
       androidPush.forget(game);
     },
-    // The Android pushes (§8.6) come last in every hook, and after the APNs
-    // flow whatever becomes of it: neither can keep the other from going out.
-    // `started` returns the number of iPhones a push-to-start was queued for.
+    // The Android pushes (§8.6) come last in every hook, so they can't keep
+    // anything else from happening. The start and the end also go out whatever
+    // becomes of the APNs flow before them. `started` returns the number of
+    // iPhones a push-to-start was queued for.
     started: (game) => {
       try {
         return push.start(game);

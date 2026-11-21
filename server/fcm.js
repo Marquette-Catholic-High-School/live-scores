@@ -73,7 +73,9 @@ export class FcmClient {
         if (typeof account?.[field] !== 'string' || account[field] === '') throw new Error(`it has no "${field}" (is it a service account key?)`);
       }
       this.#key = createPrivateKey(account.private_key);
-      this.#account = { projectId: account.project_id, clientEmail: account.client_email, tokenUri: account.token_uri || DEFAULT_TOKEN_URI };
+      const tokenUri = account.token_uri || DEFAULT_TOKEN_URI;
+      if (!URL.canParse(tokenUri)) throw new Error('its "token_uri" is not a URL');
+      this.#account = { projectId: account.project_id, clientEmail: account.client_email, tokenUri };
       this.configured = true;
     } catch (err) {
       this.error = `Couldn't load the Firebase service account key: ${err.message}`;
@@ -94,8 +96,8 @@ export class FcmClient {
   // Resolves to { ok: true, name } or { ok: false, error, ... } — never throws.
   // A message Google didn't take also says why: `status` (HTTP, null for a
   // network error), `transient` (network, 429, 5xx: the same message may go
-  // through later) and `setup` (Google refused the service account: 401, 403
-  // or a failed sign-in, which someone has to fix).
+  // through later) and `setup` (Google refused the service account for good:
+  // 401, 403 or a rejected sign-in, which someone has to fix).
   async send(message, { retryDelaysMs = this.#retryDelaysMs } = {}) {
     if (!this.configured) return { ok: false, error: `Firebase isn't set up: ${this.error}` };
     let renewed = false;
@@ -113,7 +115,7 @@ export class FcmClient {
         const retry = err.retry || !(err instanceof FcmError);
         if (!retry || attempt >= retryDelaysMs.length) {
           const status = err instanceof FcmError ? err.status : null;
-          return { ok: false, error: err.message, status, transient: retry, setup: err.auth === true || status === 401 || status === 403 };
+          return { ok: false, error: err.message, status, transient: retry, setup: !retry && (err.auth === true || status === 401 || status === 403) };
         }
         this.#log?.warn('FCM send failed; retrying', { error: err.message, attempt: attempt + 1 });
         await new Promise((resolve) => setTimeout(resolve, retryDelaysMs[attempt]));

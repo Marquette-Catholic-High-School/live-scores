@@ -6,6 +6,7 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
 import { after, before, beforeEach, describe, it } from 'node:test';
+import { AndroidPushService } from '../server/android-push.js';
 import { ConfigError, loadConfig } from '../server/config.js';
 import { FcmClient } from '../server/fcm.js';
 import { activityAttributes, activityContentState } from '../server/games.js';
@@ -409,6 +410,36 @@ describe('Android game pushes: coalescing', () => {
     }
   });
 
+  it('still sends the start as a start when an update was on its way before it', async () => {
+    // The hooks can run in this order when the scoreboard feed changes a game
+    // in the moment it starts it. Driven by hand here, on a service of its own.
+    const firebase = new FakeFirebase();
+    const t = await startAndroidApp(firebase, { gamePush: false });
+    const service = new AndroidPushService({
+      db: t.app.db, fcm: t.app.fcm, config: { ...t.config, android: { gamePush: true, collapse: false } }, store: t.app.games,
+    });
+    try {
+      const admin = await t.signedIn('admin', 'admin');
+      const game = await liveGame(admin);
+      const before = t.app.games.getGame(game.id);
+      await act(admin, game.id, { type: 'score', team: 'home', points: 2 });
+      const after = t.app.games.getGame(game.id);
+      firebase.answer = async () => {
+        await sleep(50);
+        return undefined;
+      };
+      service.changed(before, after);
+      service.start(after);
+      await waitFor(() => firebase.game(game.id).length === 2, { message: 'both messages' });
+      await service.flush(500);
+      assert.deepEqual(firebase.events(game.id), ['update', 'start']);
+      assert.equal(firebase.sent.length, 2, "and the app's own service, switched off, sent nothing");
+    } finally {
+      service.close();
+      await t.close();
+    }
+  });
+
   it('sends an update Firebase could not take again, with the latest state, at a slower pace', async () => {
     const firebase = new FakeFirebase();
     const t = await startAndroidApp(firebase, { env: { APNS_MIN_UPDATE_INTERVAL_MS: '100' } });
@@ -539,6 +570,29 @@ describe('Android game pushes: a clock reaching 0:00', () => {
       assert.equal('clockEndsAt' in update.state, false);
       await sleep(900);
       assert.equal(firebase.game(game.id).length, 4, 'and not a second time after the interval');
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('sends one update, not two, when a change lands just as the clock runs out', async () => {
+    const firebase = new FakeFirebase();
+    const t = await startAndroidApp(firebase);
+    try {
+      const admin = await t.signedIn('admin', 'admin');
+      const { game, endsAt } = await runningClock(t, firebase, admin, 300);
+      firebase.answer = async () => {
+        await sleep(100);
+        return undefined;
+      };
+      // Keep the server busy across 0:00, then change the game before its own
+      // watch on the clock gets to run: that update already says 0:00.
+      while (Date.now() < endsAt + 30) { /* busy */ }
+      t.app.games.applyScoreboard(game.id, { home: 2 });
+      const update = await waitFor(() => firebase.game(game.id)[3], { message: 'the update' });
+      assert.deepEqual([update.state.homeScore, update.state.clockRemaining, 'clockEndsAt' in update.state], [2, 0, false]);
+      await sleep(400);
+      assert.equal(firebase.game(game.id).length, 4, 'the watch on the clock adds nothing to it');
     } finally {
       await t.close();
     }
@@ -866,13 +920,21 @@ describe('FcmClient: a message Google did not take', () => {
     assert.deepEqual(await client.send(MESSAGE), { ok: false, error: 'HTTP 403: Permission denied', status: 403, transient: false, setup: true });
   });
 
-  it('counts a failed sign-in as a setup problem', async () => {
+  it('counts a rejected sign-in as a setup problem, but not one Google could not answer', async () => {
     const firebase = new FakeFirebase();
     firebase.tokenAnswer = { status: 400, body: { error: 'invalid_grant', error_description: 'Invalid JWT Signature.' } };
     const client = new FcmClient({ serviceAccount: SERVICE_ACCOUNT, fetch: firebase.fetch, retryDelaysMs: [] });
     assert.deepEqual(await client.send(MESSAGE), {
       ok: false, error: 'Google sign-in failed: HTTP 400: Invalid JWT Signature.', status: 400, transient: false, setup: true,
     });
+    firebase.tokenAnswer = { status: 503, body: {} };
+    assert.deepEqual(await client.send(MESSAGE), { ok: false, error: 'Google sign-in failed: HTTP 503', status: 503, transient: true, setup: false });
     assert.equal(firebase.sent.length, 0);
+  });
+
+  it('refuses a key file whose token address is not a URL', () => {
+    const client = new FcmClient({ serviceAccount: { ...SERVICE_ACCOUNT, token_uri: 'not a url' } });
+    assert.equal(client.configured, false);
+    assert.match(client.error, /"token_uri" is not a URL/);
   });
 });

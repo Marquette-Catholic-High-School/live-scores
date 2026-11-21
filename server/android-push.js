@@ -202,6 +202,9 @@ export class AndroidPushService {
         sending: null,
         dirty: false,
         urgent: false,
+        // Unix ms until which the phones believe the clock runs: what the last
+        // message Firebase took said. Null: stopped, or no clock.
+        runningUntil: null,
         clockTimer: null,
       };
       this.#games.set(gameId, state);
@@ -242,7 +245,9 @@ export class AndroidPushService {
     state.timer = null;
     state.sending = this.#track(this.#sendUpdate(gameId, state)).finally(() => {
       state.sending = null;
-      if (this.#games.get(gameId) === state) this.#pump(gameId, state);
+      if (this.#games.get(gameId) !== state) return;
+      this.#watchClock(gameId, state);
+      this.#pump(gameId, state);
     });
   }
 
@@ -260,9 +265,13 @@ export class AndroidPushService {
     const result = await this.#send(this.#message(game, event, { now }));
     if (this.#closed) return;
     if (result.ok) {
-      // As with APNs, the game's first update isn't held back by its start.
-      if (event === 'start') state.lastSentAt = -Infinity;
-      state.event = 'update';
+      if (event === 'start') {
+        state.event = 'update';
+        // As with APNs, the game's first update isn't held back by its start.
+        state.lastSentAt = -Infinity;
+      }
+      const end = runningClockEnd(game);
+      state.runningUntil = end !== null && end > now ? end : null;
       state.intervalMs = Math.max(this.#baseIntervalMs, state.intervalMs - UPDATE_INTERVAL_STEP_MS);
       this.#record(gameId, event, 1, 0, `v${game.version}`);
     } else {
@@ -276,38 +285,29 @@ export class AndroidPushService {
     }
     // The game ended or was deleted meanwhile: the end flow has taken over.
     const current = this.#store.getGame(gameId);
-    if (!current || current.status !== 'live' || this.#games.get(gameId) !== state) {
-      this.#drop(gameId, state);
-      return;
-    }
-    if (result.ok) {
-      const end = runningClockEnd(game);
-      this.#watchClock(gameId, state, end !== null && end > now ? end : null);
-    }
+    if (!current || current.status !== 'live' || this.#games.get(gameId) !== state) this.#drop(gameId, state);
   }
 
-  // Phones have just been told the clock runs until `runningUntil` (null: it
-  // doesn't run). The server makes no change when a clock runs out, but a
-  // notification's timer counts on below 0:00. So at that moment an update
-  // goes out without waiting for the interval: the clock stopped at 0:00, or
-  // whatever happened to it since that hasn't been sent yet.
-  #watchClock(gameId, state, runningUntil) {
+  // The server makes no change when a clock runs out, but a notification's
+  // timer counts on below 0:00. So the moment the clock the phones know about
+  // (`state.runningUntil`) gets there, an update goes out without waiting for
+  // the interval: the clock stopped at 0:00, or whatever happened to it since
+  // that hasn't been sent yet. Runs after every send, and from its own timer.
+  #watchClock(gameId, state) {
     clearTimeout(state.clockTimer);
     state.clockTimer = null;
-    if (runningUntil === null) return;
-    const check = () => {
-      state.clockTimer = null;
-      if (this.#closed || this.#games.get(gameId) !== state) return;
-      const left = runningUntil - this.#now();
-      if (left > 0) {
-        state.clockTimer = setTimeout(check, left);
-        state.clockTimer.unref();
-        return;
-      }
-      state.urgent = true;
-      this.#markDirty(gameId, state);
-    };
-    check();
+    if (state.runningUntil === null || this.#closed || this.#games.get(gameId) !== state) return;
+    const left = state.runningUntil - this.#now();
+    if (left > 0) {
+      state.clockTimer = setTimeout(() => this.#watchClock(gameId, state), left);
+      state.clockTimer.unref();
+      return;
+    }
+    // A message on its way may already say so: this runs again once it is back.
+    if (state.sending) return;
+    state.runningUntil = null;
+    state.urgent = true;
+    this.#markDirty(gameId, state);
   }
 
   // Current per-game update interval (exposed for status/tests).
